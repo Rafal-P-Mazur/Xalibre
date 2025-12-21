@@ -82,30 +82,15 @@ def get_official_toc_mapping(book):
 
 # --- IMPROVED HYPHENATION FUNCTION ---
 def hyphenate_html_text(soup, language_code):
-    """
-    Safely injects soft hyphens (\u00AD) into text nodes without
-    breaking punctuation or original spacing.
-    """
     try:
         dic = pyphen.Pyphen(lang=language_code)
     except:
-        # Fallback if specific lang not found
         try:
             dic = pyphen.Pyphen(lang='en')
         except:
             return soup
 
-    # Regex to identify "words" (alphanumeric sequences)
-    # This ensures we don't touch spaces or punctuation.
     word_pattern = re.compile(r'\w+', re.UNICODE)
-
-    def replace_match(match):
-        word = match.group(0)
-        # Only hyphenate words longer than 6 chars to keep it clean
-        if len(word) < 6:
-            return word
-        # .inserted() adds the soft hyphen (\u00AD)
-        return dic.inserted(word, hyphen='\u00AD')
 
     for text_node in soup.find_all(string=True):
         if text_node.parent.name in ['script', 'style', 'head', 'title', 'meta']:
@@ -114,8 +99,20 @@ def hyphenate_html_text(soup, language_code):
             continue
 
         original_text = str(text_node)
-        # Apply hyphenation only to the words found by regex
-        new_text = word_pattern.sub(replace_match, original_text)
+
+        # --- FIX: FORCE NORMAL SPACES ---
+        # 1. Replace Non-Breaking Space (\u00A0) with a standard space.
+        # This allows the "Justify" alignment to stretch this space evenly with the others.
+        clean_text = original_text.replace('\u00A0', ' ')
+
+        # --------------------------------
+
+        def replace_match(match):
+            word = match.group(0)
+            if len(word) < 6: return word
+            return dic.inserted(word, hyphen='\u00AD')
+
+        new_text = word_pattern.sub(replace_match, clean_text)
 
         if new_text != original_text:
             text_node.replace_with(NavigableString(new_text))
