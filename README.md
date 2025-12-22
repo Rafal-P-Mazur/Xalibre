@@ -40,18 +40,20 @@ If you have downloaded the [Release version](https://github.com/Rafal-P-Mazur/EP
 
 ## 📖 User Manual
 
-1.  **Load an EPUB:** Click **Select EPUB** in the sidebar to choose your input file.
-2.  **Configure Layout:**
-    * **Font:** Choose from the detected system/local fonts.
-    * **Sliders:** Adjust Font Size, Weight, Line Height, Margins, and Padding.
-    * **TOC:** Check "Generate TOC Pages" to include a navigation section at the beginning.
-3.  **Process:** Click the **Process / Update Preview** button. The application will:
-    * Parse the EPUB.
-    * Apply hyphenation and CSS.
-    * Render pages to memory.
-    * Update the preview pane.
-4.  **Preview:** Use the **< Previous** and **Next >** buttons to verify the rendering.
-5.  **Export:** Click **Export XTC** to save the final file.
+1.  **Load an EPUB:** Click **Select EPUB** in the sidebar. The application will instantly parse the book structure.
+2.  **Select Chapters:** A dialog will automatically appear displaying all detected chapters.
+    * **Uncheck** any chapters you wish to hide from the **Table of Contents** and **Progress Bar**.
+    * *Note:* These chapters are **not deleted**; they remain in the book for reading but will not clutter your navigation.
+3.  **Configure Layout:**
+    * **Font:** Choose from detected system/local fonts.
+    * **Settings:** Adjust Size, Weight, Line Height, Margins, and Padding. The preview will **automatically update** after a short delay when settings are changed.
+    * **Orientation:** Switch between Portrait and Landscape modes.
+    * **Preview Zoom:** Use the slider to resize the preview image (Smart Scaling automatically optimizes the zoom based on your orientation).
+4.  **Navigate & Preview:**
+    * Use the **< Previous** and **Next >** buttons to flip pages.
+    * Enter a specific number in the **"Go"** input box to jump directly to that page.
+5.  **Export:** Click **Export XTC** to save the final binary file.
+   
 ## 📦 Dependencies
 
 * `customtkinter` (GUI)
