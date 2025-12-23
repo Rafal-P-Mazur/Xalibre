@@ -44,15 +44,20 @@ If you have downloaded the [Release version](https://github.com/Rafal-P-Mazur/EP
 2.  **Select Chapters:** A dialog will automatically appear displaying all detected chapters.
     * **Uncheck** any chapters you wish to hide from the **Table of Contents** and **Progress Bar**.
     * *Note:* These chapters are **not deleted**; they remain in the book for reading but will not clutter your navigation.
-3.  **Configure Layout:**
-    * **Font:** Choose from detected system/local fonts.
-    * **Settings:** Adjust Size, Weight, Line Height, Margins, and Padding. The preview will **automatically update** after a short delay when settings are changed.
-    * **Orientation:** Switch between Portrait and Landscape modes.
-    * **Preview Zoom:** Use the slider to resize the preview image (Smart Scaling automatically optimizes the zoom based on your orientation).
-4.  **Navigate & Preview:**
+3.  **Manage Presets:**
+    * Use the dropdown menu to load saved layouts from the `presets` folder.
+    * Click **Save New Preset** to store your current configuration as a JSON file in the `presets` directory.
+    * *Tip:* You can drop external preset files (JSON) directly into the `presets` folder to use them.
+4.  **Configure Layout:**
+    * **Fonts:** To use custom fonts, place your `.ttf` or `.otf` files in the `fonts` directory. The app will automatically detect them.
+    * **General Settings:** Adjust Font Size, Weight, Line Height, Margins, and Orientation (Portrait/Landscape).
+    * **Footer Customization:** Fully control the bottom area: toggle the **Progress Bar**, **Page Numbers**, or **Chapter Title**, adjust text position, and set the bar thickness.
+    * *Note:* The preview will **automatically update** after a short delay when settings are changed.
+5.  **Navigate & Preview:**
     * Use the **< Previous** and **Next >** buttons to flip pages.
     * Enter a specific number in the **"Go"** input box to jump directly to that page.
-5.  **Export:** Click **Export XTC** to save the final binary file.
+    * Use the **Preview Zoom** slider to resize the image (Smart Scaling automatically optimizes this based on orientation).
+6.  **Export:** Click **Export XTC** to save the final binary file.
    
 ## 📦 Dependencies
 
