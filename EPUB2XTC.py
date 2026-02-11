@@ -1046,10 +1046,13 @@ class EpubProcessor:
 
         patched_css = fix_css_font_paths(self.book_css, font_family_val)
 
+        # Calculate the actual space available for text
+        content_height = max(1, self.screen_height - self.top_padding - self.bottom_padding)
+
         custom_css = f"""
-                <style>
-                    {font_face_rule}
-                    @page {{ size: {self.screen_width}pt {self.screen_height}pt; margin: 0; }}
+                        <style>
+                            {font_face_rule}
+                            @page {{ size: {self.screen_width}pt {content_height}pt; margin: 0; }}
                     body {{
                         font-family: {font_family_val} !important;
                         font-size: {self.font_size}pt !important;
@@ -1157,7 +1160,7 @@ class EpubProcessor:
 
             # --- RENDER PDF ---
             doc = fitz.open(temp_html_path)
-            rect = fitz.Rect(0, 0, self.screen_width, self.screen_height)
+            rect = fitz.Rect(0, 0, self.screen_width, content_height)
             doc.layout(rect=rect)
 
             # Save doc reference
@@ -2211,14 +2214,38 @@ class ModernApp(ctk.CTk):
     def _build_preview_area(self):
         self.preview_frame = ctk.CTkFrame(self.main_container, fg_color="#181818")
         self.preview_frame.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=10)
-        self.preview_scroll = ctk.CTkScrollableFrame(self.preview_frame, fg_color="transparent")
+
+        # Instantiate it ONCE with the new colors
+        self.preview_scroll = ctk.CTkScrollableFrame(
+            self.preview_frame,
+            fg_color="transparent",
+            scrollbar_button_color="#2B2B2B",  # Matches your card color
+            scrollbar_button_hover_color="#404040"
+        )
+
+        # CRITICAL: Put the pack() method back so it actually shows up on screen!
         self.preview_scroll.pack(fill="both", expand=True)
-        self.preview_scroll._scrollbar.configure(width=0)
+
         self.preview_scroll.grid_columnconfigure(0, weight=1)
         self.preview_scroll.grid_rowconfigure(0, weight=1)
+
         self.img_label = ctk.CTkLabel(self.preview_scroll, text="Open an EPUB to begin", font=("Arial", 16, "bold"),
                                       text_color="#333")
         self.img_label.grid(row=0, column=0, pady=20, padx=20)
+
+        def pass_scroll_event(event):
+            # Depending on the OS, delta is handled differently
+            if event.num == 4 or event.delta > 0:
+                self.preview_scroll._parent_canvas.yview_scroll(-1, "units")
+            elif event.num == 5 or event.delta < 0:
+                self.preview_scroll._parent_canvas.yview_scroll(1, "units")
+
+        # Bind for Windows / MacOS
+        self.img_label.bind("<MouseWheel>", pass_scroll_event)
+        # Bind for Linux
+        self.img_label.bind("<Button-4>", pass_scroll_event)
+        self.img_label.bind("<Button-5>", pass_scroll_event)
+
         ctrl_bar = ctk.CTkFrame(self.preview_frame, height=50, fg_color=COLOR_TOOLBAR, corner_radius=15)
         ctrl_bar.pack(side="bottom", fill="x", padx=20, pady=20)
         f_nav = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
