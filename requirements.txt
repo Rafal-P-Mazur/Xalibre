@@ -1,0 +1,13 @@
+# Core Rendering & Parsing
+PyMuPDF
+Pillow
+EbookLib
+beautifulsoup4
+Pyphen
+
+# User Interface
+customtkinter
+
+# Spectra AI Annotations (Optional but recommended)
+wordfreq
+openai
