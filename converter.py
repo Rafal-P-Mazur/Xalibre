@@ -338,114 +338,91 @@ class SpectraAnnotator:
             content = response.choices[0].message.content.strip()
             entries_found = []
 
+            # A. Try Standard JSON
             try:
-                # 4. SEND TO API
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_role},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": json_schema
-                    },
-                    temperature=0.2
-                )
+                clean = re.sub(r'^```json\s*', '', content)
+                clean = re.sub(r'\s*```$', '', clean)
+                json_data = json.loads(clean)
+                if "entries" in json_data:
+                    entries_found = json_data["entries"]
+            except json.JSONDecodeError:
+                pass
 
-                content = response.choices[0].message.content.strip()
-                entries_found = []
+            # B. Regex Fallback (if JSON fails)
+            if not entries_found:
+                # Matches: "id": "ANYTHING", "synonym": "ANYTHING"
+                pattern = r'"id"\s*:\s*"([^"]+)"\s*,\s*"(?:synonym|definition|translation|' + field_name + r')"\s*:\s*"([^"]+)"'
+                matches = re.findall(pattern, content, flags=re.IGNORECASE)
+                entries_found = [{"id": m[0], field_name: m[1]} for m in matches]
 
-                # A. Try Standard JSON
-                try:
-                    clean = re.sub(r'^```json\s*', '', content)
-                    clean = re.sub(r'\s*```$', '', clean)
-                    json_data = json.loads(clean)
-                    if "entries" in json_data:
-                        entries_found = json_data["entries"]
-                except json.JSONDecodeError:
-                    pass
+            for entry in entries_found:
+                raw_id = str(entry.get("id", "")).strip()
 
-                # B. Regex Fallback (if JSON fails)
-                if not entries_found:
-                    # Matches: "id": "ANYTHING", "synonym": "ANYTHING"
-                    pattern = r'"id"\s*:\s*"([^"]+)"\s*,\s*"(?:synonym|definition|translation|' + field_name + r')"\s*:\s*"([^"]+)"'
-                    matches = re.findall(pattern, content, flags=re.IGNORECASE)
-                    entries_found = [{"id": m[0], field_name: m[1]} for m in matches]
+                # --- RECOVERY LOGIC START ---
 
-                for entry in entries_found:
-                    raw_id = str(entry.get("id", "")).strip()
+                # 1. Normalize ID (Remove "ID:", "Item", and extra spaces)
+                # This fixes "ITEM 1" -> "1"
+                clean_id_str = re.sub(r'^(ID:|Item)\s*', '', raw_id, flags=re.IGNORECASE).strip()
 
-                    # --- RECOVERY LOGIC START ---
+                # 2. Junk Filter (Instruction Echo Fix)
+                if len(clean_id_str) > 40 and " " in clean_id_str:
+                    # print(f"[Spectra DEBUG] 🗑️ Discarding junk ID: '{clean_id_str[:30]}...'")
+                    continue
 
-                    # 1. Normalize ID (Remove "ID:", "Item", and extra spaces)
-                    # This fixes "ITEM 1" -> "1"
-                    clean_id_str = re.sub(r'^(ID:|Item)\s*', '', raw_id, flags=re.IGNORECASE).strip()
+                final_key = None
 
-                    # 2. Junk Filter (Instruction Echo Fix)
-                    if len(clean_id_str) > 40 and " " in clean_id_str:
-                        # print(f"[Spectra DEBUG] 🗑️ Discarding junk ID: '{clean_id_str[:30]}...'")
-                        continue
+                # --- STRATEGY A: Exact Match ---
+                if raw_id in to_fetch:
+                    final_key = raw_id
 
-                    final_key = None
+                # --- STRATEGY B: Number/Index Match ---
+                # Fixes "Item 1", "ITEM 1", "1"
+                elif clean_id_str.isdigit():
+                    idx = int(clean_id_str) - 1
+                    if 0 <= idx < len(ordered_keys):
+                        final_key = ordered_keys[idx]
 
-                    # --- STRATEGY A: Exact Match ---
-                    if raw_id in to_fetch:
-                        final_key = raw_id
+                # --- STRATEGY C: Hash Extraction ---
+                # Fixes "word | hash" (spaces) or "gratfully|hash" (typos)
+                elif '|' in raw_id:
+                    possible_hash = raw_id.split('|')[-1].strip()
+                    if possible_hash in hash_lookup:
+                        final_key = hash_lookup[possible_hash]
 
-                    # --- STRATEGY B: Number/Index Match ---
-                    # Fixes "Item 1", "ITEM 1", "1"
-                    elif clean_id_str.isdigit():
-                        idx = int(clean_id_str) - 1
-                        if 0 <= idx < len(ordered_keys):
-                            final_key = ordered_keys[idx]
+                # --- STRATEGY D: Bare Hash Match ---
+                # Fixes "3e8cdd"
+                elif raw_id in hash_lookup:
+                    final_key = hash_lookup[raw_id]
 
-                    # --- STRATEGY C: Hash Extraction ---
-                    # Fixes "word | hash" (spaces) or "gratfully|hash" (typos)
-                    elif '|' in raw_id:
-                        possible_hash = raw_id.split('|')[-1].strip()
-                        if possible_hash in hash_lookup:
-                            final_key = hash_lookup[possible_hash]
-
-                    # --- STRATEGY D: Bare Hash Match ---
-                    # Fixes "3e8cdd"
-                    elif raw_id in hash_lookup:
-                        final_key = hash_lookup[raw_id]
-
-                    # --- STRATEGY E: Word Fallback ---
-                    # Fixes cases where hash is missing but word is correct
-                    elif raw_id in reverse_lookup:
-                        for complex_key in reverse_lookup[raw_id]:
-                            val = entry.get(field_name) or entry.get("definition") or entry.get("synonym") or entry.get(
-                                "translation")
-                            if val:
-                                clean_val = val.strip().rstrip('.,;!')
-                                if self.target_lang != "German": clean_val = clean_val.lower()
-                                if clean_val.lower() != raw_id.lower():
-                                    self.master_cache[complex_key] = clean_val
-                        continue
-
-                        # --- ASSIGNMENT ---
-                    if final_key:
+                # --- STRATEGY E: Word Fallback ---
+                # Fixes cases where hash is missing but word is correct
+                elif raw_id in reverse_lookup:
+                    for complex_key in reverse_lookup[raw_id]:
                         val = entry.get(field_name) or entry.get("definition") or entry.get("synonym") or entry.get(
                             "translation")
                         if val:
                             clean_val = val.strip().rstrip('.,;!')
                             if self.target_lang != "German": clean_val = clean_val.lower()
+                            if clean_val.lower() != raw_id.lower():
+                                self.master_cache[complex_key] = clean_val
+                    continue
 
-                            # Prevent circular definitions
-                            original_word = final_key.split('|')[0]
-                            if clean_val.lower() != original_word.lower():
-                                self.master_cache[final_key] = clean_val
+                # --- ASSIGNMENT ---
+                if final_key:
+                    val = entry.get(field_name) or entry.get("definition") or entry.get("synonym") or entry.get(
+                        "translation")
+                    if val:
+                        clean_val = val.strip().rstrip('.,;!')
+                        if self.target_lang != "German": clean_val = clean_val.lower()
 
-                    # Only log genuine errors now
-                    elif len(raw_id) < 20:
-                        print(f"[Spectra DEBUG] ❌ Orphaned Response: '{raw_id}'")
+                        # Prevent circular definitions
+                        original_word = final_key.split('|')[0]
+                        if clean_val.lower() != original_word.lower():
+                            self.master_cache[final_key] = clean_val
 
-            except Exception as e:
-                print(f"Spectra API Error: {e}")
-
-
+                # Only log genuine errors now
+                elif len(raw_id) < 20:
+                    print(f"[Spectra DEBUG] ❌ Orphaned Response: '{raw_id}'")
 
         except Exception as e:
             print(f"Spectra API Error: {e}")
