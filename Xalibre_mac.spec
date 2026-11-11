@@ -110,16 +110,13 @@ pyz = PYZ(a.pure, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='Xalibre',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -128,9 +125,19 @@ exe = EXE(
     entitlements_file='entitlements.plist' if os.path.exists('entitlements.plist') else None,
 )
 
-# Wraps the executable into a double-clickable macOS .app bundle
-app = BUNDLE(
+coll = COLLECT(
     exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='Xalibre',
+)
+
+# Wraps into a double-clickable native macOS .app bundle
+app = BUNDLE(
+    coll,
     name='Xalibre.app',
     icon='icon.icns' if os.path.exists('icon.icns') else None,
     bundle_identifier='com.xalibre.app',
