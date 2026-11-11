@@ -68,7 +68,7 @@ for opt_mod in ('scipy', 'scipy.ndimage', 'openai', 'fonttools', 'wordfreq'):
         pass
 
 # --- Collect packages with data/binary assets ---
-for pkg in ('customtkinter', 'tkinterdnd2', 'pyphen', 'fitz', 'wordfreq'):
+for pkg in ('customtkinter', 'tkinterdnd2', 'pyphen', 'fitz', 'wordfreq', 'ebooklib'):
     try:
         tmp_ret = collect_all(pkg)
         datas += tmp_ret[0]
