@@ -144,12 +144,13 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'Xalibre',
         'CFBundleDisplayName': 'Xalibre',
+        'CFBundleExecutable': 'Xalibre',
+        'CFBundleIconFile': 'icon.icns',
         'CFBundleIdentifier': 'com.xalibre.app',
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleVersion': '1.0.0',
         'CFBundlePackageType': 'APPL',
         'NSHighResolutionCapable': True,
-        'LSMinimumSystemVersion': '11.0',
         'NSHumanReadableCopyright': '© 2026 Xalibre',
     },
 )
