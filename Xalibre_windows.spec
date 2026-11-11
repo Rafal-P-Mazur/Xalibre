@@ -33,6 +33,9 @@ for preset_dir in ('presets', 'Presets'):
         break
 
 binaries = []
+for lib_name in ('dither_accel.dll', 'dither_accel.so', 'dither_accel.dylib'):
+    if os.path.exists(lib_name):
+        binaries.append((lib_name, '.'))
 hiddenimports = [
     'pymupdf',
     'pymupdf._extra',
@@ -114,7 +117,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
