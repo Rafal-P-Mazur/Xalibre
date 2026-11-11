@@ -1,106 +1,131 @@
 # Xalibre Library Manager & Converter
 
-**Xalibre** is a comprehensive e-book management tool designed to organize your EPUB library, fetch metadata, edit book details, and convert files into the optimized **XTC** format for e-ink devices (specifically the Xteink X4).
+**Xalibre** is an e-book management suite and rendering pipeline designed to organize digital libraries, curate metadata, and convert books and comics into the optimized **XTC** format for e-ink devices (including the Xteink X4).
 
-> **Note:** This application was formerly known as **Epub2XTC** before evolving into the full-featured Xalibre Library Manager.
+Formerly known as *Epub2XTC*, Xalibre has grown into a full-featured desktop library manager with cross-platform support for Windows and macOS.
 
 ---
 
-## ✨ Features
+## Features
 
-* **📚 Library Management**: Organize, sort, and filter your e-book collection with a local SQLite database.
-* **⚡ EPUB to XTC Conversion**: Convert standard books into **1-bit** or **2-bit** bitmaps optimized for high-performance e-ink rendering.
-* **🧠 Spectra AI**: A "Word Wise"-like language learning engine that uses AI to analyze text difficulty and generate inline synonyms/translations above complex words.
-* **📝 Inline Footnotes**: Automatically extracts footnotes (which usually require jumping to the end of the book) and inserts them directly into the text inside a box immediately after the paragraph where they are referenced.
-* **☁️ Metadata Fetching**: Automatically scrape book details and high-quality covers from Google Books, Apple Books, and Open Library.
-* **🖱️ Smart Drag & Drop**: Import books by dropping them in, and export specific formats (Cover, EPUB, or XTC) by dragging cards out.
-* **📡 Wireless Device Manager**: Browse files on your Xteink X4 and transfer books wirelessly via Wi-Fi.
+- **Multi-Format Ingestion**: Import EPUB, CBZ, CBR, PDF, MOBI, AZW, FB2, and plain text files. Non-EPUB formats are automatically normalized for rendering.
+- **EPUB to XTC Conversion Engine**: Generate 1-bit (XTG, high-contrast monochrome) or 2-bit (XTH, 4-level grayscale) bitmap streams tailored for e-ink refresh rates and contrast curves.
+- **Advanced Dithering**: Choose between Bayer 8x8 ordered dithering (ideal for manga screentones), Atkinson error diffusion (sharp text without background noise), or Floyd-Steinberg, with optional C acceleration.
+- **Spectra AI (Vocabulary Assistant)**: "Word Wise"-style automated lexical glosses. Uses Age of Acquisition (AoA) linguistics data and OpenAI models to detect challenging words and insert inline definitions or translations above text.
+- **Inline Footnotes**: Automatically detects endnotes and footnotes across chapters and renders them directly below the referencing paragraph in clean callout boxes.
+- **Metadata Fetching**: Scrape book summaries, publication details, and high-resolution cover artwork from Google Books, Apple Books, and Open Library.
+- **Smart Drag-and-Drop**: Drop files into the application to import. Drag book cards or individual badges to extract covers, source EPUBs, or converted XTC files.
+- **Wireless Device Sync**: Transfer files directly to the Xteink X4 over local Wi-Fi, dedicated hotspots (`192.168.3.3`), or USB mount points.
+
 ---
+
 ![App Screenshot 1](images/1.png)
 ![App Screenshot 2](images/2.png)
+
 ---
 
-## 🚀 Getting Started
+## Supported Input Formats
+
+| Format | Import Pipeline |
+| :--- | :--- |
+| **EPUB** | Native EPUB parsing, CSS styling, chapter splitting, and metadata extraction. |
+| **CBZ / CBR** | Comic book archives with automatic page sorting, orientation detection, and image filtering. |
+| **PDF** | Text extraction and image rendering via PyMuPDF. |
+| **MOBI / AZW** | Decompression and conversion via `mobi` and optional `ebook-convert` integration. |
+| **FB2 / TXT** | Automated structural parsing, encoding detection, and chapter demarcation. |
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.10, 3.11, or 3.12
+- Git
 
 ### Installation
-* **Run**: Execute the `Xalibre-main.py` script or launch the compiled executable.
-* **First Run**: The application automatically creates necessary directories:
-    * **Windows Config**: `%APPDATA%\Xalibre`
-    * **Mac/Linux Config**: `~/.config/Xalibre`
-    * **Library Data**: Creates `Library`, `Exports`, `Presets`, and `Fonts` folders in your base directory (default `~/Xalibre`).
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/Rafal-P-Mazur/Xalibre.git
+   cd Xalibre
+   ```
+
+2. Create and activate a virtual environment:
+   - **macOS / Linux:**
+     ```bash
+     python3 -m venv .venv
+     source .venv/bin/activate
+     ```
+   - **Windows (PowerShell):**
+     ```powershell
+     python -m venv .venv
+     .venv\Scripts\Activate.ps1
+     ```
+
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. (Optional) Compile C Dithering Accelerator:
+   - **macOS / Linux:**
+     ```bash
+     clang -O3 -shared -fPIC dither_accel.c -o dither_accel.dylib
+     ```
+   - **Windows:**
+     A precompiled `dither_accel.dll` is used, or fallback pure Python/NumPy logic runs automatically.
+
+5. Launch Xalibre:
+   ```bash
+   python Xalibre.py
+   ```
 
 ---
 
-## 📚 Library Manager
+## Building Standalone Packages
 
-The main interface is your central hub for organizing, viewing, and deploying your books.
+### macOS (`dist/Xalibre.app`)
+Run the automated build script:
+```bash
+chmod +x build_mac.sh
+./build_mac.sh
+```
+Or run PyInstaller with the macOS spec file:
+```bash
+pyinstaller Xalibre_mac.spec --clean --noconfirm
+```
+See [README_MAC.md](README_MAC.md) for details on macOS security entitlements and codesigning.
 
-### 1. Organizing & Browsing
-* **Importing**: Drag `.epub` files directly onto the window (background turns green) or click **`＋ Import`**.
-* **Searching**: Filter by Title or Author in real-time using the top-right search bar.
-* **Views**: Toggle between **Grid View** (Cover cards) and **List View** (Compact rows).
-* **Deleting**: Click the **`🗑`** icon on a card. You can also delete specific file formats (e.g., just the converted XTC file) by clicking the **`✕`** on the file badge.
-
-### 2. Built-in Viewers
-Accessed by clicking a book's cover or right-clicking to open **Book Details**:
-* **`📖 View Epub`**: Renders HTML structure to verify source content and chapters.
-* **`🖼 View XTC`**: Pixel-perfect preview of the binary XTC file. This allows you to check dithering quality and layout without the hardware device.
-* *Note: There is no raw hex viewer.*
-
-### 3. Device Manager (Sending Books)
-Xalibre includes a dedicated manager for the Xteink X4:
-* **Manual Manager**: Click **`📟 Device Mgr`** to connect to the device IP. You can browse folders and **drag & drop** files into the list to upload.
-* **Quick Send**: Select books in the library and click **`📲 Send`**.
-    * **Wi-Fi**: Supports Custom IP, X4 Hotspot (`192.168.3.3`), and CrossPoint profiles.
-    * **USB**: Export to a local folder (optionally creating a `/Covers` directory for lock screens).
-
-### 4. Smart Export (Granular Drag & Drop)
-You can export files by dragging items *from* the library card to your computer:
-* **Cover Only**: Drag the **Cover Image** (.BMP).
-* **Original**: Drag the orange **.EPUB badge**.
-* **Converted**: Drag the green/teal **.XTC badge**.
-* **Full Package**: Drag the **background** of the card to export a folder containing all files.
-
-### 5. Metadata Editor
-* **Fetch Cloud Data**: Select books and click **`☁ Fetch`** to scrape descriptions and covers.
-* **Manual Edit**: Right-click a book -> **`✎ Edit Manually`** to change text or upload custom covers.
+### Windows (`dist/Xalibre.exe`)
+```powershell
+pyinstaller Xalibre_windows.spec --clean --noconfirm
+```
 
 ---
 
-## ⚡ Converter Engine (EPUB to XTC)
+## Application Layout & Data Storage
 
-Select a book and click **`⚡ Convert`** to open the Editor. This prepares the file for the e-ink screen.
-
-### 1. Render Engine
-* **Target Format**: 
-    * `1-bit (XTG)`: Pure Black & White (Best for text clarity).
-    * `2-bit (XTH)`: 4-Level Grayscale (Best for Manga/Images).
-* **Mode**: 
-    * `Threshold`: High contrast for text.
-    * `Dither`: Dot patterns for shading images.
-
-### 2. Typography & Layout
-* **Fonts**: Choose system fonts or import custom ones.
-* **Inline Footnotes**: Enable this to extract standard endnotes and insert them into a box directly below the paragraph where they are referenced.
-* **Sizing**: Adjust Font Size (default 28pt), Weight, and Line Height.
-* **Custom Fonts**: Click **`Aa Import Font`** in the converter toolbar to add `.ttf` or `.otf` files to your library.
-
-### 3. Spectra AI
-* **Functionality**: Acts like "Word Wise", providing inline glossaries for difficult terms.
-* **Configuration**:
-    * **API**: Requires OpenAI API Key.
-    * **Target Language**: Select language for definitions or translations.
-    * **Difficulty**: Set threshold based on Zipf frequency & Age of Acquisition (AoA) to determine which words get annotated.
-
-### 4. Presets
-* Save your complex settings (e.g., "Night Mode", "Manga", "Language Learning") as reusable **Presets** using the `💾` icon.
+On initial launch, Xalibre sets up application data directories:
+- **Base Directory**: `~/Xalibre` (configurable in settings)
+  - `Library/`: Managed copies of imported books.
+  - `Exports/`: Converted files and exported packages.
+  - `Presets/`: Saved converter and layout profiles (`.json`).
+  - `Fonts/`: User-installed fonts (`.ttf`, `.otf`) in addition to bundled fonts.
+- **Database**: SQLite database stored at `~/Xalibre/xalibre.db`.
+- **Configuration**: User preferences saved to `~/Xalibre/default_settings.json` (or `Application Support/Xalibre` on macOS).
 
 ---
 
-## ⚙️ Settings
+## Technical Details
 
-**Access**: Click the large **"Xalibre MANAGER"** logo text in the top-left of the toolbar.
+- **GUI Framework**: CustomTkinter with TkinterDnD2 drag-and-drop integration.
+- **Document & Image Processing**: PyMuPDF (`fitz`), Pillow, NumPy, EbookLib, Beautiful Soup 4.
+- **Hyphenation & Linguistics**: Pyphen hyphenation dictionaries and Kuperman Age-of-Acquisition dataset (`AoA_51715_words.csv`).
+- **Typography**: Bundled reader fonts including Atkinson Hyperlegible, Charis SIL, DejaVu Sans/Serif, Bookerly, and Literata.
 
-* **Library Location**: Change the physical path of your library folder.
-* **Device IP**: Set the default IP address for the X4 Reader.
-* **Defaults**: Configure startup preferences (Grid/List view, Sort order).
+---
+
+## License
+
+This project is licensed under the MIT License. Bundled fonts retain their respective open font licenses (OFL / SIL).
