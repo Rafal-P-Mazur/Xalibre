@@ -1,18 +1,26 @@
 import customtkinter as ctk
-from tkinterdnd2 import DND_FILES, TkinterDnD
-
 try:
-    # Try to import DnDWrapper from the internal module (newer versions)
-    from tkinterdnd2.TkinterDnD import DnDWrapper
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    try:
+        from tkinterdnd2.TkinterDnD import DnDWrapper
+    except ImportError:
+        from tkinterdnd2 import DnDWrapper
 except ImportError:
-    # Fallback for older versions
-    from tkinterdnd2 import DnDWrapper
+    DND_FILES = "DND_Files"
+    class DnDWrapper:
+        def drag_source_register(self, *args, **kwargs): pass
+        def drop_target_register(self, *args, **kwargs): pass
+        def dnd_bind(self, *args, **kwargs): pass
+    class TkinterDnD:
+        @staticmethod
+        def _require(widget): return None
 
 from tkinter import filedialog, messagebox, simpledialog
 import os
 import sqlite3
 import io
 import shutil
+import tempfile
 import json
 import threading
 from PIL import Image, ImageEnhance, ImageOps
@@ -39,6 +47,7 @@ except ImportError:
 # --- IMPORTS ---
 import database
 import converter  # The provided converter.py file
+import importers  # TXT / FB2 / MOBI / CBZ / PDF ... -> EPUB converters
 
 warnings.filterwarnings("ignore")
 
@@ -191,6 +200,7 @@ for d in [BASE_DIR, LIBRARY_DIR, EXPORT_DIR, PRESETS_DIR, FONTS_DIR]:
 # Link converter constants
 converter.PRESETS_DIR = PRESETS_DIR
 converter.SETTINGS_FILE = os.path.join(BASE_DIR, "default_settings.json")
+converter.DEVICES_FILE = os.path.join(BASE_DIR, "devices.json")
 
 
 def update_global_paths(new_base):
@@ -209,6 +219,7 @@ def update_global_paths(new_base):
     # Re-link converter constants to the new paths
     converter.PRESETS_DIR = PRESETS_DIR
     converter.SETTINGS_FILE = os.path.join(BASE_DIR, "default_settings.json")
+    converter.DEVICES_FILE = os.path.join(BASE_DIR, "devices.json")
 
 
 # Load config immediately to set paths
@@ -242,24 +253,24 @@ def get_combined_fonts():
 
     def scan_folder(directory):
         if not os.path.exists(directory): return
-        # Walk through directory
+        families = {}  # name -> [paths]
         for root, dirs, files in os.walk(directory):
-            for file in files:
+            for file in sorted(files):
                 if file.lower().endswith((".ttf", ".otf")):
                     full_path = os.path.join(root, file)
-
-                    # Determine Font Name (Folder Name if inside a folder, else Filename)
                     rel_path = os.path.relpath(root, directory)
                     if rel_path == ".":
-                        # File is directly in Fonts root -> Use Filename
-                        name = os.path.splitext(file)[0]
+                        name = os.path.splitext(file)[0]          # loose file -> its own entry
                     else:
-                        # File is in a subfolder -> Use Subfolder Name (Family Name)
-                        # We use the top-level folder name inside the fonts dir
-                        name = rel_path.split(os.sep)[0]
+                        name = rel_path.split(os.sep)[0]          # family folder name
+                    families.setdefault(name, []).append(full_path)
 
-                    # Add to map (Latest scan overwrites previous, so scan User last)
-                    font_map[name] = full_path
+        for name, paths in families.items():
+            # Pick the real Regular face (by font metadata), NOT whichever file was walked last
+            if len(paths) == 1:
+                font_map[name] = paths[0]
+            else:
+                font_map[name] = converter.pick_regular_face(paths) or paths[0]
 
     # 1. Scan Bundled First
     scan_folder(BUNDLED_FONTS_DIR)
@@ -277,6 +288,7 @@ for d in [BASE_DIR, LIBRARY_DIR, EXPORT_DIR, PRESETS_DIR, FONTS_DIR]:
 # Override converter defaults to point to Xlibre folders
 converter.PRESETS_DIR = PRESETS_DIR
 converter.SETTINGS_FILE = os.path.join(BASE_DIR, "default_settings.json")
+converter.DEVICES_FILE = os.path.join(BASE_DIR, "devices.json")
 
 
 def inject_cover_into_epub(epub_path, cover_bytes):
@@ -286,6 +298,10 @@ def inject_cover_into_epub(epub_path, cover_bytes):
     This prevents file corruption while updating the image.
     """
     if not epub_path or not os.path.exists(epub_path):
+        return
+    # Comic EPUBs: rewriting through ebooklib would drop the comic marker (and load every page into RAM).
+    # Their cover is simply page 1, so leave the file untouched.
+    if importers.is_comic_epub(epub_path):
         return
 
     try:
@@ -715,6 +731,12 @@ class IntegratedEditor(ctk.CTkToplevel):
         self.grab_set()
         self.configure(fg_color="#111111")
 
+        # Keyboard navigation for page preview
+        self.bind("<Left>", lambda e: self._on_arrow_key(-1))
+        self.bind("<Right>", lambda e: self._on_arrow_key(1))
+        self.bind("<Prior>", lambda e: self._on_arrow_key(-1))
+        self.bind("<Next>", lambda e: self._on_arrow_key(1))
+
         # Internal State
         self.current_page_index = 0
         self.debounce_timer = None
@@ -731,11 +753,16 @@ class IntegratedEditor(ctk.CTkToplevel):
             except:
                 pass
 
+        converter.load_custom_devices()
+        converter.set_active_device(self.startup_settings.get("device", converter.DEFAULT_DEVICE))
+
         # UI Construction (Reusing ModernApp logic)
         self._build_toolbar()
         self.main_container = ctk.CTkFrame(self, fg_color="#111111")
         self.main_container.pack(fill="both", expand=True)
         self._build_sidebar()
+        self._build_comic_card()
+        self._apply_mode_cards(False)
         self._build_preview_area()
 
         # Load Presets
@@ -769,15 +796,17 @@ class IntegratedEditor(ctk.CTkToplevel):
 
     def refresh_fonts_list(self):
         """Re-scan the Fonts directory and update the dropdown menu."""
-        # --- CHANGE: Use combined fonts function ---
         self.available_fonts = get_combined_fonts()
         self.font_options = ["Default (System)"] + sorted(list(self.available_fonts.keys()))
-
-        # Rebuild the internal map
         self.font_map = self.available_fonts.copy()
         self.font_map["Default (System)"] = "DEFAULT"
 
-        # Update the UI Dropdown
+        # Dodanie opcji 'Extracted from EPUB (Original)', jeśli książka zawiera wbudowane fonty
+        if hasattr(self.processor, 'extracted_fonts') and self.processor.extracted_fonts:
+            option_name = "Extracted from EPUB (Original)"
+            self.font_options.insert(0, option_name)
+            self.font_map[option_name] = "EPUB_ORIGINAL"
+
         self.font_dropdown.configure(values=self.font_options)
 
     # --- UI WRAPPERS (Mirrors ModernApp but points to self) ---
@@ -796,7 +825,7 @@ class IntegratedEditor(ctk.CTkToplevel):
         ctk.CTkFrame(parent, height=2, fg_color="#333").pack(fill="x", pady=10)
 
     def _create_slider(self, parent, label_attr, text, slider_attr, min_v, max_v, is_float=False, width=None,
-                       trigger_auto_update=True, label_width=130):
+                       trigger_auto_update=True, label_width=130, show_value=True):
         f = ctk.CTkFrame(parent, fg_color="transparent")
         f.pack(fill="x", pady=2)
 
@@ -808,6 +837,8 @@ class IntegratedEditor(ctk.CTkToplevel):
             return float(f"{val:.1f}") if is_float else int(val)
 
         def get_label_text(val):
+            if not show_value:
+                return text
             v_num = get_fmt_val(val)
             return f"{text}: {v_num}"
 
@@ -876,6 +907,19 @@ class IntegratedEditor(ctk.CTkToplevel):
 
         # Set Initial Entry Value
         entry.insert(0, str(get_fmt_val(default_val)))
+
+        # Wrap slider.set() to keep companion entry field and label in sync when set programmatically (e.g. Presets)
+        orig_set = sld.set
+        def custom_set(val):
+            orig_set(val)
+            lbl.configure(text=get_label_text(val))
+            formatted = str(get_fmt_val(val))
+            if entry.get() != formatted:
+                entry.delete(0, "end")
+                entry.insert(0, formatted)
+        sld.set = custom_set
+        sld.entry = entry
+        sld.get_fmt_val = get_fmt_val
 
         # Register attributes
         setattr(self, f"fmt_{slider_attr}", get_label_text)
@@ -953,9 +997,16 @@ class IntegratedEditor(ctk.CTkToplevel):
         r_mode = ctk.CTkFrame(c_ren.content, fg_color="transparent")
         r_mode.pack(fill="x", pady=2)
         ctk.CTkLabel(r_mode, text="Conversion:", width=130, anchor="w").pack(side="left")
-        self.render_mode_var = ctk.StringVar(value="Threshold")
-        ctk.CTkOptionMenu(r_mode, values=["Threshold", "Dither"], variable=self.render_mode_var,
+        rm_val = self.startup_settings.get("render_mode", "Threshold")
+        if rm_val == "Dither":
+            rm_val = "Floyd-Steinberg"
+        self.render_mode_var = ctk.StringVar(value=rm_val)
+        ctk.CTkOptionMenu(r_mode, values=["Threshold", "Floyd-Steinberg", "Atkinson", "Bayer"], variable=self.render_mode_var,
                           command=self.toggle_render_controls, height=22).pack(side="right", fill="x", expand=True)
+
+        self.var_invert = ctk.BooleanVar(value=bool(self.startup_settings.get("invert_colors", False)))
+        ctk.CTkCheckBox(c_ren.content, text="Invert Colors (Dark Mode)", variable=self.var_invert,
+                        command=self.schedule_update, height=22).pack(fill="x", pady=(4, 2))
 
         self.frm_render_dynamic = ctk.CTkFrame(c_ren.content, fg_color="transparent")
         self.frm_render_dynamic.pack(fill="x", pady=5)
@@ -972,8 +1023,12 @@ class IntegratedEditor(ctk.CTkToplevel):
 
         # TYPOGRAPHY
         c_type = converter.SettingsCard(self.sidebar, "TYPOGRAPHY")
+        self.card_type = c_type
         r_font = ctk.CTkFrame(c_type.content, fg_color="transparent")
         r_font.pack(fill="x", pady=2)
+        self._font_row = r_font
+        self.lbl_font_warn = ctk.CTkLabel(c_type.content, text="", text_color="#E67E22", wraplength=340,
+                                          justify="left", anchor="w", font=("Arial", 11))
         ctk.CTkLabel(r_font, text="Font Family:", width=130, anchor="w").pack(side="left")
 
         self.available_fonts = get_combined_fonts()
@@ -1004,11 +1059,21 @@ class IntegratedEditor(ctk.CTkToplevel):
         self._create_slider(c_type.content, "lbl_size", "Font Size", "slider_font_size", 12, 48)
         self._create_slider(c_type.content, "lbl_weight", "Font Weight", "slider_font_weight", 100, 900)
         self._create_slider(c_type.content, "lbl_line", "Line Height", "slider_line_height", 1.0, 2.5, is_float=True)
+        self._create_slider(c_type.content, "lbl_para_space", "Paragraph Spacing", "slider_paragraph_spacing", 0.0, 2.0,
+                            is_float=True)
         self._create_slider(c_type.content, "lbl_word_space", "Word Spacing", "slider_word_spacing", 0.0, 2.0,
                             is_float=True)
 
         # LAYOUT
         c_lay = converter.SettingsCard(self.sidebar, "PAGE LAYOUT")
+        self.card_lay = c_lay
+        r_dev = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_dev.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_dev, text="Device:", width=130, anchor="w").pack(side="left")
+        self.device_var = ctk.StringVar(value=converter.DEFAULT_DEVICE)
+        self.device_dropdown = ctk.CTkOptionMenu(r_dev, values=list(converter.DEVICE_PROFILES.keys()),
+                                                 variable=self.device_var, command=self.on_device_change, height=22)
+        self.device_dropdown.pack(side="right", fill="x", expand=True)
         r_ori = ctk.CTkFrame(c_lay.content, fg_color="transparent")
         r_ori.pack(fill="x", pady=2)
         ctk.CTkLabel(r_ori, text="Orientation:", width=130, anchor="w").pack(side="left")
@@ -1016,6 +1081,11 @@ class IntegratedEditor(ctk.CTkToplevel):
         ctk.CTkOptionMenu(r_ori, values=["Portrait", "Landscape (90°)", "Landscape (270°)"],
                           variable=self.orientation_var,
                           command=self.schedule_update, height=22).pack(side="right", fill="x", expand=True)
+        r_cover_rot = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_cover_rot.pack(fill="x", pady=2)
+        self.var_keep_cover_portrait = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(r_cover_rot, text="Keep Cover in Portrait", variable=self.var_keep_cover_portrait,
+                        command=self.schedule_update, font=("Arial", 12)).pack(side="left")
         r_tog = ctk.CTkFrame(c_lay.content, fg_color="transparent")
         r_tog.pack(fill="x", pady=5)
         self.var_toc = ctk.BooleanVar(value=True)
@@ -1038,11 +1108,13 @@ class IntegratedEditor(ctk.CTkToplevel):
 
         # HEADER & FOOTER
         c_hf = converter.SettingsCard(self.sidebar, "HEADER & FOOTER")
+        self.card_hf = c_hf
         grid_hf = ctk.CTkFrame(c_hf.content, fg_color="transparent")
         grid_hf.pack(fill="x")
 
         # SPECTRA AI
         c_spectra = converter.SettingsCard(self.sidebar, "SPECTRA AI ANNOTATIONS")
+        self.card_spectra = c_spectra
         if not converter.HAS_WORDFREQ or not converter.HAS_OPENAI:
             ctk.CTkLabel(c_spectra.content, text="Missing libraries:\npip install wordfreq openai",
                          text_color="#C0392B").pack()
@@ -1211,25 +1283,28 @@ class IntegratedEditor(ctk.CTkToplevel):
                 self.preview_scroll._parent_canvas.yview_scroll(1, "units")
 
         self.img_label.bind("<MouseWheel>", pass_scroll_event)
+        self.img_label.bind("<Button-1>", lambda e: self.focus_set())
 
         ctrl_bar = ctk.CTkFrame(self.preview_frame, height=50, fg_color="#1a1a1a", corner_radius=15)
         ctrl_bar.pack(side="bottom", fill="x", padx=20, pady=20)
         f_nav = ctk.CTkFrame(ctrl_bar, fg_color="transparent");
         f_nav.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkButton(f_nav, text="◀", width=40, command=self.prev_page, fg_color="#333").pack(side="left", padx=5)
+        self.btn_prev = ctk.CTkButton(f_nav, text="◀", width=40, command=self.prev_page, fg_color="#333")
+        self.btn_prev.pack(side="left", padx=5)
         f_page_stack = ctk.CTkFrame(f_nav, fg_color="transparent");
         f_page_stack.pack(side="left", padx=10)
-        self.lbl_page = ctk.CTkLabel(f_page_stack, text="0 / 0", font=("Arial", 14, "bold"), width=80);
+        self.lbl_page = ctk.CTkLabel(f_page_stack, text="0 / 0", font=("Arial", 13, "bold"), width=160);
         self.lbl_page.pack(side="top")
         self.entry_page = ctk.CTkEntry(f_page_stack, width=50, height=20, placeholder_text="#", justify="center",
                                        font=("Arial", 10))
         self.entry_page.pack(side="top", pady=(2, 0));
         self.entry_page.bind('<Return>', lambda e: self.go_to_page())
-        ctk.CTkButton(f_nav, text="▶", width=40, command=self.next_page, fg_color="#333").pack(side="left", padx=5)
+        self.btn_next = ctk.CTkButton(f_nav, text="▶", width=40, command=self.next_page, fg_color="#333")
+        self.btn_next.pack(side="left", padx=5)
         f_zoom = ctk.CTkFrame(ctrl_bar, fg_color="transparent")
         f_zoom.place(relx=0.97, rely=0.5, anchor="e")  # Pins it to the right edge vertically centered
         self._create_slider(f_zoom, "lbl_preview_zoom", "Zoom", "slider_preview_zoom", 200, 800, width=150,
-                            label_width=75)
+                            label_width=50, show_value=False)
 
     # --- LOGIC WIRING ---
 
@@ -1244,18 +1319,39 @@ class IntegratedEditor(ctk.CTkToplevel):
 
     def _on_structure_parsed(self, success):
         if not success:
-            messagebox.showerror("Error", "Failed to parse EPUB.")
+            messagebox.showerror("Error", "Failed to open this book.")
             return
 
-        # Enable the toolbar button
+        # Załaduj fonty do dropdownu
+        self.refresh_fonts_list()
+
+        # Font choice: the saved default / preset font wins. The book's own fonts are only
+        # auto-selected when no usable default font is configured (or the default IS the EPUB option).
+        epub_opt = "Extracted from EPUB (Original)"
+        has_epub = bool(getattr(self.processor, 'extracted_fonts', None))
+        preferred = self.startup_settings.get("font_name", "")
+        if preferred in self.font_options:
+            chosen = preferred
+        elif has_epub:
+            chosen = epub_opt
+        else:
+            chosen = self.font_dropdown.get() if self.font_dropdown.get() in self.font_options else self.font_options[0]
+        self.font_dropdown.set(chosen)
+        self.processor.font_path = self.font_map[chosen]
+
+        is_comic = bool(getattr(self.processor, "is_comic", False))
+        self._apply_mode_cards(is_comic)
+        if is_comic:
+            # Comics are all images: dithering is the sensible default (applies to this book only)
+            if self.render_mode_var.get() == "Threshold":
+                self.render_mode_var.set("Floyd-Steinberg")
+            self.toggle_render_controls()
+
         self.btn_chapters.configure(state="normal")
-
-        # --- FIX: STOP AUTO-RENDER. OPEN DIALOG FIRST ---
-        # OLD: self.run_processing()  <-- This was causing the immediate render
-
-        # NEW: Force the selection dialog to open immediately.
-        # This pauses the process until you click "Confirm" in the popup.
-        self.open_chapter_dialog()
+        if is_comic and len(self.processor.raw_chapters) == 1:
+            self._on_chapters_selected([0])      # nothing to choose: skip the dialog
+        else:
+            self.open_chapter_dialog()
 
     def run_processing(self):
         if not self.processor.input_file: return
@@ -1263,6 +1359,8 @@ class IntegratedEditor(ctk.CTkToplevel):
             return
         self.is_processing = True
         self.pending_rerun = False
+        if hasattr(self, 'btn_prev'): self.btn_prev.configure(state="disabled")
+        if hasattr(self, 'btn_next'): self.btn_next.configure(state="disabled")
         self.progress_label.configure(text="Rendering Layout...")
         settings = self.gather_current_ui_settings()
         threading.Thread(target=lambda: self._task_render(settings)).start()
@@ -1308,12 +1406,15 @@ class IntegratedEditor(ctk.CTkToplevel):
 
     def _done(self, success):
         self.is_processing = False
+        if hasattr(self, 'btn_prev'): self.btn_prev.configure(state="normal")
+        if hasattr(self, 'btn_next'): self.btn_next.configure(state="normal")
         if self.pending_rerun:
             self.after(10, self.run_processing)
             return
 
         self.progress_label.configure(text="Ready")
         self.progress_bar.set(0)
+        self._update_font_warning_label()
 
         if success and self.processor.total_pages > 0:
             self.btn_export.configure(state="normal")
@@ -1325,13 +1426,17 @@ class IntegratedEditor(ctk.CTkToplevel):
 
             self.show_page(self.current_page_index)
         else:
-            # If it failed or has 0 pages, show a message
-            self.img_label.configure(text="No pages rendered.")
+            # If it failed or has 0 pages, show a message safely
+            try:
+                self.img_label.configure(text="No pages rendered.")
+            except Exception:
+                pass
 
     def save_to_library(self):
         # Auto-generate destination path in EXPORT_DIR
         safe_title = "".join([c for c in self.book_data[1] if c.isalnum() or c in " -_"])
-        filename = f"{safe_title}.xtc"
+        ext = ".xtch" if "2-bit" in self.bit_depth_var.get() else ".xtc"
+        filename = f"{safe_title}{ext}"
         out_path = os.path.join(EXPORT_DIR, filename)
         threading.Thread(target=lambda: self._run_export(out_path)).start()
 
@@ -1386,9 +1491,11 @@ class IntegratedEditor(ctk.CTkToplevel):
             pass
 
     def show_page(self, idx):
-        # GUARD: If layout isn't built or map is empty, do nothing
-        if not self.processor.is_ready or not self.processor.page_map:
-            self.img_label.configure(image=None, text="Calculating Layout...")
+        # GUARD: If layout is currently processing or isn't built or map is empty, do nothing
+        if getattr(self, "is_processing", False) or not getattr(self.processor, "is_ready", False) or not getattr(self.processor, "page_map", None):
+            return
+
+        if self.processor.total_pages <= 0:
             return
 
         # Ensure index stays in bounds
@@ -1399,6 +1506,15 @@ class IntegratedEditor(ctk.CTkToplevel):
             img = self.processor.render_page(idx)
             if not img: return
 
+            # If in Landscape mode and the page was rotated for the physical hardware panel,
+            # rotate it upright for comfortable viewing in the PC preview
+            ori = self.processor.layout_settings.get("orientation", "Portrait")
+            is_landscape = "Landscape" in ori
+            is_cover = (idx == 0)
+            keep_portrait = is_cover and is_landscape and self.processor.layout_settings.get("keep_cover_portrait", True)
+            if is_landscape and not keep_portrait:
+                img = img.rotate(90 if "270" in ori else 270, expand=True)
+
             # Preview scaling logic
             base_size = int(self.slider_preview_zoom.get())
             ratio = img.width / img.height
@@ -1406,18 +1522,58 @@ class IntegratedEditor(ctk.CTkToplevel):
                                                                                          int(base_size / ratio))
 
             ctk_img = ctk.CTkImage(light_image=img, size=(tw, th))
-            self.img_label.configure(image=ctk_img, text="")
-            self.lbl_page.configure(text=f"{idx + 1} / {self.processor.total_pages}")
+            self._preview_ctk_img = ctk_img  # Keep strong reference to prevent GC deletion of pyimage
+            try:
+                self.img_label.configure(image=ctk_img, text="")
+            except Exception:
+                try:
+                    self.img_label._label.configure(image="")
+                    self.img_label.configure(image=ctk_img, text="")
+                except Exception:
+                    pass
+            if getattr(self.processor, "is_comic", False) and getattr(self.processor, "comic_units", None):
+                u = self.processor.comic_units[idx] if idx < len(self.processor.comic_units) else None
+                total_actual = len(self.processor.comic_meta["pages"]) if self.processor.comic_meta and "pages" in self.processor.comic_meta else 0
+                if u and total_actual:
+                    actual_page = u["p"] + 1
+                    half_str = f" {u['half']}" if u.get("half") else ""
+                    self.lbl_page.configure(text=f"{idx + 1} / {self.processor.total_pages} (p. {actual_page}{half_str}/{total_actual})")
+                else:
+                    self.lbl_page.configure(text=f"{idx + 1} / {self.processor.total_pages}")
+            else:
+                self.lbl_page.configure(text=f"{idx + 1} / {self.processor.total_pages}")
         except Exception as e:
             print(f"Render sync: {e}")  # Caught during rapid slider movement
 
+    def _on_arrow_key(self, direction):
+        if getattr(self, "is_processing", False) or not getattr(self.processor, "is_ready", False):
+            return
+        focused = self.focus_get()
+        if focused:
+            w = focused
+            while w:
+                cls_name = type(w).__name__.lower()
+                if "entry" in cls_name or "text" in cls_name:
+                    return
+                w = getattr(w, "master", None)
+        if direction < 0:
+            self.prev_page()
+        else:
+            self.next_page()
+
     def prev_page(self):
+        if getattr(self, "is_processing", False) or not getattr(self.processor, "is_ready", False):
+            return
         self.show_page(max(0, self.current_page_index - 1))
 
     def next_page(self):
+        if getattr(self, "is_processing", False) or not getattr(self.processor, "is_ready", False):
+            return
         self.show_page(min(self.processor.total_pages - 1, self.current_page_index + 1))
 
     def go_to_page(self):
+        if getattr(self, "is_processing", False) or not getattr(self.processor, "is_ready", False):
+            return
         try:
             self.show_page(max(0, min(int(self.entry_page.get()) - 1, self.processor.total_pages - 1)))
         except:
@@ -1443,7 +1599,7 @@ class IntegratedEditor(ctk.CTkToplevel):
                 safe = "".join([c for c in self.processor.title_metadata if c.isalnum() or c in " -_"]).strip()
                 if safe: fname = f"{safe}.bmp"
             path = filedialog.asksaveasfilename(defaultextension=".bmp", initialfile=fname, filetypes=[("Bitmap", "*.bmp")])
-            if path: threading.Thread(target=lambda: self._run_cover_export(path, 480, 800, "Crop to Fill (Best)")).start()
+            if path: threading.Thread(target=lambda: self._run_cover_export(path, *converter.ACTIVE_DEVICE_SIZE, "Crop to Fill (Best)")).start()
         else:
             messagebox.showinfo("Info", "No cover found.")
 
@@ -1479,6 +1635,86 @@ class IntegratedEditor(ctk.CTkToplevel):
         if self.is_processing: self.pending_rerun = True; return
         self.run_processing()
 
+    def _build_comic_card(self):
+        card = converter.SettingsCard(self.sidebar, "COMIC / PDF / MANGA", expanded=True)
+        self.card_comic = card
+        cc = card.content
+
+        def row(label, var, values):
+            r = ctk.CTkFrame(cc, fg_color="transparent")
+            r.pack(fill="x", pady=2)
+            ctk.CTkLabel(r, text=label, width=130, anchor="w").pack(side="left")
+            ctk.CTkOptionMenu(r, values=values, variable=var, command=self.schedule_update, height=22).pack(
+                side="right", fill="x", expand=True)
+
+        self.comic_crop_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS["comic_crop"])
+        row("Crop margins:", self.comic_crop_var, ["Off", "Auto", "Aggressive"])
+        self._create_slider(cc, "lbl_comic_crop_pad", "Crop padding %", "slider_comic_crop_pad", 0.0, 6.0, is_float=True)
+
+        self.comic_spreads_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS["comic_spreads"])
+        row("Double pages:", self.comic_spreads_var, ["Split", "Full+Split", "Rotate", "Fit"])
+
+        self.comic_zoom_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS["comic_zoom"])
+        row("Zoom parts:", self.comic_zoom_var, ["Off", "Tiers (Smart)", "2 (top/bottom)", "3 (rows)", "4 (2x2)"])
+        self._create_slider(cc, "lbl_comic_overlap", "Part overlap %", "slider_comic_overlap", 0, 20)
+        self.comic_scrollbar_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS.get("comic_scrollbar", "Right"))
+        row("Page scrollbar:", self.comic_scrollbar_var, ["Off", "Right", "Left"])
+
+        self.comic_peek_mode_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS.get("comic_peek_mode", "Full Art"))
+        row("Peeked context:", self.comic_peek_mode_var, ["Full Art", "Dimmed", "Off"])
+
+        self.comic_rtl_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS["comic_rtl"])
+        row("Reading order:", self.comic_rtl_var, ["Auto", "Left-to-right", "Right-to-left"])
+
+        self.comic_fit_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS["comic_fit"])
+        row("Scaling:", self.comic_fit_var, ["Fit", "Fill"])
+
+        self._create_slider(cc, "lbl_comic_gamma", "Gamma", "slider_comic_gamma", 0.5, 2.0, is_float=True)
+        self._create_slider(cc, "lbl_comic_sharpen", "Sharpen", "slider_comic_sharpen", 0.0, 2.0, is_float=True)
+
+        self.comic_autolevels_var = ctk.BooleanVar(value=converter.FACTORY_DEFAULTS["comic_autolevels"])
+        ctk.CTkCheckBox(cc, text="Auto levels (stretch contrast)", variable=self.comic_autolevels_var,
+                        command=self.schedule_update).pack(anchor="w", pady=(4, 2))
+        self.comic_pagenum_var = ctk.BooleanVar(value=converter.FACTORY_DEFAULTS["comic_page_numbers"])
+        ctk.CTkCheckBox(cc, text="Show page number strip", variable=self.comic_pagenum_var,
+                        command=self.schedule_update).pack(anchor="w", pady=2)
+
+        self.comic_bolden_var = ctk.StringVar(value=converter.FACTORY_DEFAULTS.get("comic_bolden", "Off"))
+        row("Text bolden:", self.comic_bolden_var, ["Off", "Auto", "Light", "Strong"])
+
+        self.comic_clean_bubbles_var = ctk.BooleanVar(value=converter.FACTORY_DEFAULTS.get("comic_clean_bubbles", False))
+        ctk.CTkCheckBox(cc, text="Crisp speech bubbles (Threshold mask)", variable=self.comic_clean_bubbles_var,
+                        command=self.schedule_update).pack(anchor="w", pady=2)
+
+        ctk.CTkLabel(cc, text="Tip: zoom parts read best with Orientation set to Landscape.\n"
+                              "Dithering uses the RENDER ENGINE card above.", justify="left",
+                     text_color="gray", font=("Arial", 11)).pack(anchor="w", pady=(6, 0))
+
+    def _apply_mode_cards(self, is_comic):
+        """Text books show the typography cards; comics show the comic card instead."""
+        cards = [self.card_type, self.card_lay, self.card_hf, self.card_spectra, self.card_comic]
+        for c in cards:
+            c.pack_forget()
+        order = [self.card_comic, self.card_lay] if is_comic else [self.card_type, self.card_lay, self.card_hf,
+                                                                    self.card_spectra]
+        for c in order:
+            c.pack(fill="x", pady=5, padx=10)
+
+    def _update_font_warning_label(self):
+        warns = getattr(self.processor, "font_warnings", None) or []
+        try:
+            if warns:
+                self.lbl_font_warn.configure(text="\u26a0 " + "\n\u26a0 ".join(warns[:4]))
+                self.lbl_font_warn.pack(fill="x", padx=5, pady=(0, 4), after=self._font_row)
+            else:
+                self.lbl_font_warn.pack_forget()
+        except Exception:
+            pass
+
+    def on_device_change(self, choice):
+        converter.set_active_device(choice)
+        self.schedule_update()
+
     def on_font_change(self, choice):
         self.processor.font_path = self.font_map[choice]
         self.schedule_update()
@@ -1508,7 +1744,7 @@ class IntegratedEditor(ctk.CTkToplevel):
         mode = self.render_mode_var.get()
         self.frm_dither.pack_forget();
         self.frm_thresh.pack_forget()
-        if mode == "Dither":
+        if mode in ("Dither", "Floyd-Steinberg", "Atkinson", "Bayer"):
             self.frm_dither.pack(fill="x")
         elif mode == "Threshold":
             self.frm_thresh.pack(fill="x")
@@ -1540,12 +1776,15 @@ class IntegratedEditor(ctk.CTkToplevel):
             "toc_insert_page": toc_insert,
             "font_size": int(self.slider_font_size.get()),
             "font_weight": int(self.slider_font_weight.get()),
+            "paragraph_spacing": float(self.slider_paragraph_spacing.get()),
             "line_height": float(self.slider_line_height.get()),
             "word_spacing": float(self.slider_word_spacing.get()),
             "margin": int(self.slider_margin.get()),
             "top_padding": int(self.slider_top_padding.get()),
             "bottom_padding": int(self.slider_bottom_padding.get()),
             "orientation": self.orientation_var.get(),
+            "keep_cover_portrait": self.var_keep_cover_portrait.get() if hasattr(self, 'var_keep_cover_portrait') else True,
+            "device": self.device_var.get(),
             "text_align": self.align_dropdown.get(),
             "hyphenate_text": self.var_hyphenate.get(),
             "font_name": self.font_dropdown.get(),
@@ -1577,8 +1816,25 @@ class IntegratedEditor(ctk.CTkToplevel):
             "footer_align": self.var_footer_align.get(),
             "footer_font_size": int(self.slider_footer_font_size.get()),
             "footer_margin": int(self.slider_footer_margin.get()),
+            "comic_crop": self.comic_crop_var.get(),
+            "comic_crop_pad": float(self.slider_comic_crop_pad.get()),
+            "comic_spreads": self.comic_spreads_var.get(),
+            "comic_zoom": self.comic_zoom_var.get(),
+            "comic_overlap": int(self.slider_comic_overlap.get()),
+            "comic_rtl": self.comic_rtl_var.get(),
+            "comic_fit": self.comic_fit_var.get(),
+            "comic_gamma": float(self.slider_comic_gamma.get()),
+            "comic_sharpen": float(self.slider_comic_sharpen.get()),
+            "comic_autolevels": self.comic_autolevels_var.get(),
+            "comic_page_numbers": self.comic_pagenum_var.get(),
+            "comic_peek_mode": self.comic_peek_mode_var.get(),
+            "comic_fill_tiers": self.comic_peek_mode_var.get() != "Off",
+            "comic_scrollbar": self.comic_scrollbar_var.get(),
+            "comic_bolden": self.comic_bolden_var.get() if hasattr(self, "comic_bolden_var") else "Off",
+            "comic_clean_bubbles": bool(self.comic_clean_bubbles_var.get()) if hasattr(self, "comic_clean_bubbles_var") else False,
             "render_mode": self.render_mode_var.get(),
             "bit_depth": self.bit_depth_var.get(),
+            "invert_colors": bool(self.var_invert.get()) if hasattr(self, "var_invert") else False,
             "white_clip": int(self.slider_white_clip.get()),
             "contrast": float(self.slider_contrast.get()),
             "text_threshold": int(self.slider_text_threshold.get()),
@@ -1601,11 +1857,19 @@ class IntegratedEditor(ctk.CTkToplevel):
         self.slider_font_size.set(s['font_size'])
         self.slider_font_weight.set(s['font_weight'])
         self.slider_line_height.set(s['line_height'])
+        self.slider_paragraph_spacing.set(s.get('paragraph_spacing', 0.5))
         self.slider_word_spacing.set(s.get('word_spacing', 0.0))
         self.slider_margin.set(s['margin'])
         self.slider_top_padding.set(s['top_padding'])
         self.slider_bottom_padding.set(s['bottom_padding'])
         self.orientation_var.set(s['orientation'])
+        if hasattr(self, 'var_keep_cover_portrait'):
+            self.var_keep_cover_portrait.set(s.get('keep_cover_portrait', True))
+        dev = s.get("device", converter.DEFAULT_DEVICE)
+        if dev not in converter.DEVICE_PROFILES:
+            dev = converter.DEFAULT_DEVICE
+        self.device_var.set(dev)
+        converter.set_active_device(dev)
         self.align_dropdown.set(s['text_align'])
         self.var_hyphenate.set(s.get('hyphenate_text', True))
         self.slider_preview_zoom.set(s['preview_zoom'])
@@ -1636,7 +1900,32 @@ class IntegratedEditor(ctk.CTkToplevel):
         self.var_footer_align.set(s['footer_align'])
         self.slider_footer_font_size.set(s['footer_font_size'])
         self.slider_footer_margin.set(s['footer_margin'])
-        self.render_mode_var.set(s.get("render_mode", "Threshold"))
+        self.comic_crop_var.set(s.get("comic_crop", "Auto"))
+        self.slider_comic_crop_pad.set(s.get("comic_crop_pad", 1.5))
+        self.comic_spreads_var.set(s.get("comic_spreads", "Split"))
+        self.comic_zoom_var.set(s.get("comic_zoom", "Off"))
+        self.slider_comic_overlap.set(s.get("comic_overlap", 6))
+        self.comic_rtl_var.set(s.get("comic_rtl", "Auto"))
+        self.comic_fit_var.set(s.get("comic_fit", "Fit"))
+        self.slider_comic_gamma.set(s.get("comic_gamma", 1.0))
+        self.slider_comic_sharpen.set(s.get("comic_sharpen", 0.6))
+        self.comic_autolevels_var.set(s.get("comic_autolevels", True))
+        self.comic_pagenum_var.set(s.get("comic_page_numbers", False))
+        if hasattr(self, "comic_bolden_var"):
+            self.comic_bolden_var.set(s.get("comic_bolden", "Off"))
+        if hasattr(self, "comic_clean_bubbles_var"):
+            self.comic_clean_bubbles_var.set(bool(s.get("comic_clean_bubbles", False)))
+        peek_val = s.get("comic_peek_mode")
+        if not peek_val:
+            peek_val = "Full Art" if s.get("comic_fill_tiers", True) else "Off"
+        self.comic_peek_mode_var.set(peek_val)
+        self.comic_scrollbar_var.set(s.get("comic_scrollbar", "Right"))
+        rm_val = s.get("render_mode", "Threshold")
+        if rm_val == "Dither":
+            rm_val = "Floyd-Steinberg"
+        self.render_mode_var.set(rm_val)
+        if hasattr(self, 'var_invert'):
+            self.var_invert.set(bool(s.get('invert_colors', False)))
         self.slider_white_clip.set(s.get("white_clip", 220))
         self.slider_contrast.set(s.get("contrast", 1.2))
         self.slider_text_threshold.set(s.get("text_threshold", 130))
@@ -1665,6 +1954,11 @@ class IntegratedEditor(ctk.CTkToplevel):
                 sld = getattr(self, attr)
                 lbl_name = attr.replace("slider_", "lbl_")
                 if hasattr(self, lbl_name): getattr(self, lbl_name).configure(text=fmt(sld.get()))
+                if hasattr(sld, "entry") and hasattr(sld, "get_fmt_val"):
+                    formatted = str(sld.get_fmt_val(sld.get()))
+                    if sld.entry.get() != formatted:
+                        sld.entry.delete(0, "end")
+                        sld.entry.insert(0, formatted)
 
         if s["font_name"] in self.font_options:
             self.font_dropdown.set(s["font_name"])
@@ -1918,7 +2212,8 @@ class BatchConvertDialog(ctk.CTkToplevel):
 
             title = b[1]
             safe_title = "".join([c for c in title if c.isalnum() or c in " -_"])
-            path_xtc = os.path.join(EXPORT_DIR, f"{safe_title}.xtc")
+            ext = ".xtch" if "2-bit" in settings.get("bit_depth", "") else ".xtc"
+            path_xtc = os.path.join(EXPORT_DIR, f"{safe_title}{ext}")
 
             self.update_ui(i, total, f"Converting: {title[:20]}...")
 
@@ -1926,13 +2221,19 @@ class BatchConvertDialog(ctk.CTkToplevel):
                 proc = converter.EpubProcessor()
                 if not proc.parse_book_structure(path_epub): continue
 
-                if settings.get("spectra_enabled", False):
+                book_settings = dict(settings)
+                if proc.is_comic and book_settings.get("render_mode") == "Threshold":
+                    book_settings["render_mode"] = "Floyd-Steinberg"   # comics need dithering; same default as the editor
+
+                if settings.get("spectra_enabled", False) and not proc.is_comic:
                     proc.init_annotator(settings)
                     all_indices = list(range(len(proc.raw_chapters)))
                     proc.annotator.analyze_chapters(proc.raw_chapters, all_indices)
 
                 f_name = settings.get("font_name", "")
-                if f_name in font_map:
+                if f_name == "Extracted from EPUB (Original)":
+                    proc.font_path = "EPUB_ORIGINAL"
+                elif f_name in font_map:
                     proc.font_path = font_map[f_name]
                 elif font_map:
                     first_key = sorted(list(font_map.keys()))[0]
@@ -1953,7 +2254,7 @@ class BatchConvertDialog(ctk.CTkToplevel):
                     orientation=settings['orientation'],
                     add_toc=settings['generate_toc'],
                     show_footnotes=settings.get('show_footnotes', True),
-                    layout_settings=settings
+                    layout_settings=book_settings
                 )
 
                 proc.save_xtc(path_xtc)
@@ -2410,6 +2711,11 @@ class SimpleEpubReader(ctk.CTkToplevel):
 
     def _load_book(self):
         try:
+            if importers.is_comic_epub(self.file_path):
+                self.after(0, lambda: self.content_area.insert(
+                    "1.0", "This is a comic / PDF / fixed-layout document. It has no text to read here.\n\n"
+                           "Use 'Convert' (the editor) to preview pages with cropping, splitting and dithering."))
+                return
             self.book = epub.read_epub(self.file_path)
             toc_items = []
 
@@ -2478,6 +2784,7 @@ class XtcBookViewer(ctk.CTkToplevel):
         self.current_page = 0
         self.page_offsets = []
         self.chapters = []
+        self.rotation_angle = 0
 
         # --- Layout ---
         self.grid_columnconfigure(1, weight=1)
@@ -2493,6 +2800,7 @@ class XtcBookViewer(ctk.CTkToplevel):
 
         self.lbl_info = ctk.CTkLabel(self.toolbar, text="Loading...", font=("Arial", 12, "bold"), text_color="#AAA")
         self.lbl_info.pack(side="left", padx=10)
+        ctk.CTkButton(self.toolbar, text="⟳ Rotate", width=75, height=24, command=self.toggle_rotation, fg_color="#333").pack(side="right", padx=10)
 
         # 3. Image Area
         self.scroll = ctk.CTkScrollableFrame(self, fg_color="#1a1a1a")
@@ -2509,6 +2817,12 @@ class XtcBookViewer(ctk.CTkToplevel):
         self.lbl_page = ctk.CTkLabel(self.nav, text="Page 0/0", font=("Arial", 14, "bold"))
         self.lbl_page.pack(side="left", expand=True)
         ctk.CTkButton(self.nav, text="Next ▶", width=80, command=self.next_page).pack(side="right", padx=10)
+
+        # Keyboard navigation
+        self.bind("<Left>", lambda e: self.prev_page())
+        self.bind("<Right>", lambda e: self.next_page())
+        self.bind("<Prior>", lambda e: self.prev_page())
+        self.bind("<Next>", lambda e: self.next_page())
 
         # Start Parsing
         self.parse_xtc_structure()
@@ -2638,6 +2952,10 @@ class XtcBookViewer(ctk.CTkToplevel):
                 # 1-bit Standard (Horizontal)
                 img = Image.frombytes('1', (w, h), bitmap_data)
 
+            if getattr(self, "rotation_angle", 0) != 0:
+                img = img.rotate(self.rotation_angle, expand=True)
+                w, h = img.size
+
             # --- PREVIEW SCALING ---
             # 1. Convert to Grayscale (L) for smooth scaling
             if img.mode != "L":
@@ -2659,6 +2977,10 @@ class XtcBookViewer(ctk.CTkToplevel):
         except Exception as e:
             self.after(0, lambda: self.img_label.configure(text=f"Render Error: {e}", image=None))
 
+    def toggle_rotation(self):
+        self.rotation_angle = (getattr(self, "rotation_angle", 0) + 90) % 360
+        self.show_page(self.current_page)
+
     def prev_page(self):
         self.show_page(self.current_page - 1)
 
@@ -2678,6 +3000,13 @@ def detect_xtc_version(filepath):
 
     try:
         with open(filepath, "rb") as f:
+            # Check Container Header magic first
+            magic_bytes = f.read(4)
+            if len(magic_bytes) == 4:
+                magic = struct.unpack("<I", magic_bytes)[0]
+                if magic == 0x48435458:
+                    return ("2-BIT", "#1ABC9C")  # Teal for 2-bit (XTCH)
+
             # 1. Read Container Header (56 bytes)
             # The Data Offset is a Q (unsigned long long) at offset 32
             # struct format: <IHHBBBBIQQQQQ
@@ -2711,7 +3040,10 @@ class BookCard(ctk.CTkFrame, DnDWrapper):
     def __init__(self, parent, book_data, on_convert, on_details, on_delete, on_select, on_delete_file,
                  on_status_update, scroll_cb):
         super().__init__(parent, fg_color="#2B2B2B", corner_radius=10, border_width=1, border_color="#333")
-        self.TkdndVersion = TkinterDnD._require(self)
+        try:
+            self.TkdndVersion = TkinterDnD._require(self)
+        except Exception:
+            self.TkdndVersion = None
         self.book_data = book_data
         self.var = ctk.BooleanVar(value=False)
         self.scroll_cb = scroll_cb
@@ -2897,7 +3229,7 @@ class BookCard(ctk.CTkFrame, DnDWrapper):
                 if b[5]:
                     try:
                         img = Image.open(io.BytesIO(b[5])).convert("RGB")
-                        img = ImageOps.fit(img, (480, 800), method=Image.Resampling.LANCZOS)
+                        img = ImageOps.fit(img, converter.ACTIVE_DEVICE_SIZE, method=Image.Resampling.LANCZOS)
                         img = ImageEnhance.Contrast(img.convert("L")).enhance(1.6).convert("1")
                         img.save(os.path.join(b_dir, "cover.bmp"))
                     except:
@@ -2911,7 +3243,7 @@ class BookCard(ctk.CTkFrame, DnDWrapper):
                     out = os.path.join(EXPORT_DIR, f"{safe}_cover.bmp")
                     try:
                         img = Image.open(io.BytesIO(b[5])).convert("RGB")
-                        img = ImageOps.fit(img, (480, 800), method=Image.Resampling.LANCZOS)
+                        img = ImageOps.fit(img, converter.ACTIVE_DEVICE_SIZE, method=Image.Resampling.LANCZOS)
                         img = ImageEnhance.Contrast(img.convert("L")).enhance(1.6).convert("1")
                         img.save(out)
                         files.append(out)
@@ -2976,7 +3308,10 @@ class BookRow(ctk.CTkFrame, DnDWrapper):
     def __init__(self, parent, book_data, on_convert, on_details, on_delete, on_select, on_delete_file,
                  on_status_update, scroll_cb):
         super().__init__(parent, fg_color="#2B2B2B", height=50, corner_radius=6)
-        self.TkdndVersion = TkinterDnD._require(self)
+        try:
+            self.TkdndVersion = TkinterDnD._require(self)
+        except Exception:
+            self.TkdndVersion = None
         self.pack_propagate(False)
         self.book_data = book_data
         self.var = ctk.BooleanVar(value=False)
@@ -3143,7 +3478,7 @@ class BookRow(ctk.CTkFrame, DnDWrapper):
                 if b[5]:
                     try:
                         img = Image.open(io.BytesIO(b[5])).convert("RGB")
-                        img = ImageOps.fit(img, (480, 800), method=Image.Resampling.LANCZOS)
+                        img = ImageOps.fit(img, converter.ACTIVE_DEVICE_SIZE, method=Image.Resampling.LANCZOS)
                         img = ImageEnhance.Contrast(img.convert("L")).enhance(1.6).convert("1")
                         img.save(os.path.join(b_dir, "cover.bmp"))
                     except:
@@ -3156,7 +3491,7 @@ class BookRow(ctk.CTkFrame, DnDWrapper):
                     out = os.path.join(EXPORT_DIR, f"{safe}_cover.bmp")
                     try:
                         img = Image.open(io.BytesIO(b[5])).convert("RGB")
-                        img = ImageOps.fit(img, (480, 800), method=Image.Resampling.LANCZOS)
+                        img = ImageOps.fit(img, converter.ACTIVE_DEVICE_SIZE, method=Image.Resampling.LANCZOS)
                         img = ImageEnhance.Contrast(img.convert("L")).enhance(1.6).convert("1")
                         img.save(out)
                         files.append(out)
@@ -3175,7 +3510,10 @@ class BookRow(ctk.CTkFrame, DnDWrapper):
 class DeviceRow(ctk.CTkFrame, DnDWrapper):
     def __init__(self, parent, item_data, browser_ref, current_path):
         super().__init__(parent, fg_color="transparent", height=40, corner_radius=6)
-        self.TkdndVersion = TkinterDnD._require(self)
+        try:
+            self.TkdndVersion = TkinterDnD._require(self)
+        except Exception:
+            self.TkdndVersion = None
         self.browser = browser_ref
         self.item = item_data
         self.full_path = f"{current_path}/{item_data['name']}".replace("//", "/")
@@ -3199,9 +3537,12 @@ class DeviceRow(ctk.CTkFrame, DnDWrapper):
         self.btn_main.bind("<ButtonRelease-1>", self._on_release)
 
         # 2. Register for Dragging OUT (Only for files)
-        if not self.is_dir:
-            self.drag_source_register(1, DND_FILES)
-            self.dnd_bind('<<DragInitCmd>>', self.drag_init_out)
+        if not self.is_dir and getattr(self, "TkdndVersion", None):
+            try:
+                self.drag_source_register(1, DND_FILES)
+                self.dnd_bind('<<DragInitCmd>>', self.drag_init_out)
+            except Exception:
+                pass
 
         # 3. Size Info
         if not self.is_dir:
@@ -3224,9 +3565,12 @@ class DeviceRow(ctk.CTkFrame, DnDWrapper):
                       command=lambda: self.browser.delete_item(self.full_path)).pack(side="left", padx=2)
 
         # 5. Drop Target (For folders)
-        if self.is_dir:
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind('<<Drop>>', self.on_drop)
+        if self.is_dir and getattr(self, "TkdndVersion", None):
+            try:
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind('<<Drop>>', self.on_drop)
+            except Exception:
+                pass
 
         # Important: Register DND on the button too!
         self._register_drag_on_all(self)
@@ -3295,9 +3639,12 @@ class RemoteDeviceBrowser(ctk.CTkToplevel, DnDWrapper):
         self.current_path = "/"
 
         # --- Enable Drop Support ---
-        self.TkdndVersion = TkinterDnD._require(self)
-        self.drop_target_register(DND_FILES)
-        self.dnd_bind('<<Drop>>', lambda e: self.handle_drop(e, self.current_path))
+        try:
+            self.TkdndVersion = TkinterDnD._require(self)
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', lambda e: self.handle_drop(e, self.current_path))
+        except Exception:
+            self.TkdndVersion = None
 
         # --- Top Bar ---
         top = ctk.CTkFrame(self, height=60, fg_color="#222")
@@ -3345,8 +3692,16 @@ class RemoteDeviceBrowser(ctk.CTkToplevel, DnDWrapper):
         self.refresh_root()
 
     # --- LOGIC ---
-    def get_url(self, endpoint):
-        return f"http://{self.entry_ip.get().strip()}{endpoint}"
+    def get_url(self, endpoint, ip=None):
+        if not ip:
+            ip = self.entry_ip.get().strip()
+        if not ip.startswith("http://") and not ip.startswith("https://"):
+            base = f"http://{ip}"
+        else:
+            base = ip.rstrip("/")
+        if not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        return f"{base}{endpoint}"
 
     def refresh_current_path(self):
         self.load_path(self.current_path)
@@ -3357,17 +3712,50 @@ class RemoteDeviceBrowser(ctk.CTkToplevel, DnDWrapper):
         self.update_storage_status()
 
     def update_storage_status(self):
-        threading.Thread(target=self._task_status).start()
+        ip = self.entry_ip.get().strip()
+        threading.Thread(target=lambda: self._task_status(ip)).start()
 
-    def _task_status(self):
+    def _task_status(self, ip):
         try:
-            resp = requests.get(self.get_url("/status"), timeout=3)
+            # 1. Try CrossPoint status first if already identified or if crosspoint is in host
+            low = ip.lower()
+            prefer_cp = getattr(self, "is_crosspoint", False) or "crosspoint" in low or "192.168.4.1" in low
+
+            if prefer_cp:
+                resp = requests.get(self.get_url("/api/status", ip=ip), timeout=3)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self.is_crosspoint = True
+                    dev = data.get("device") or "CrossPoint"
+                    ver = data.get("version", "")
+                    label = f"{dev} {ver}".strip() or "Connected"
+                    self.after(0, lambda: self.lbl_status.configure(text=label, text_color="#2ECC71"))
+                    return
+
+            # 2. Try stock Xteink endpoint
+            resp = requests.get(self.get_url("/status", ip=ip), timeout=3)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    total = data.get('totalBytes', 1)
+                    used = data.get('usedBytes', 0)
+                    pct = (used / total) * 100
+                    self.is_crosspoint = False
+                    self.after(0, lambda: self.lbl_status.configure(text=f"{pct:.1f}% Used", text_color="#2ECC71"))
+                    return
+                except Exception:
+                    pass
+
+            # 3. Fallback to CrossPoint status if stock returned non-JSON / 404
+            resp = requests.get(self.get_url("/api/status", ip=ip), timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
-                total = data.get('totalBytes', 1)
-                used = data.get('usedBytes', 0)
-                pct = (used / total) * 100
-                self.after(0, lambda: self.lbl_status.configure(text=f"{pct:.1f}% Used", text_color="#2ECC71"))
+                self.is_crosspoint = True
+                dev = data.get("device") or "CrossPoint"
+                ver = data.get("version", "")
+                label = f"{dev} {ver}".strip() or "Connected"
+                self.after(0, lambda: self.lbl_status.configure(text=label, text_color="#2ECC71"))
+                return
         except:
             pass
 
@@ -3378,14 +3766,53 @@ class RemoteDeviceBrowser(ctk.CTkToplevel, DnDWrapper):
 
         loading = ctk.CTkLabel(self.scroll, text="Loading...", text_color="gray")
         loading.pack(pady=20)
-        threading.Thread(target=lambda: self._fetch_list(path, loading)).start()
+        ip = self.entry_ip.get().strip()
+        threading.Thread(target=lambda: self._fetch_list(path, ip, loader=loading)).start()
 
-    def _fetch_list(self, path, loader):
+    def _fetch_list(self, path, ip, loader):
         try:
-            url = self.get_url("/list")
-            resp = requests.get(url, params={"dir": path}, timeout=5)
-            resp.encoding = 'utf-8'
-            data = resp.json()
+            low = ip.lower()
+            prefer_cp = getattr(self, "is_crosspoint", False) or "crosspoint" in low or "192.168.4.1" in low
+
+            endpoints = [
+                ("/api/files", {"path": path}),
+                ("/list", {"dir": path})
+            ] if prefer_cp else [
+                ("/list", {"dir": path}),
+                ("/api/files", {"path": path})
+            ]
+
+            data = None
+            last_err = None
+            for ep, params in endpoints:
+                try:
+                    url = self.get_url(ep, ip=ip)
+                    resp = requests.get(url, params=params, timeout=5)
+                    if resp.status_code == 200:
+                        resp.encoding = 'utf-8'
+                        raw = resp.json()
+                        if isinstance(raw, list):
+                            data = []
+                            for item in raw:
+                                is_dir = bool(item.get("isDirectory", False) or item.get("type") == "dir")
+                                data.append({
+                                    "name": item.get("name", ""),
+                                    "type": "dir" if is_dir else "file",
+                                    "size": item.get("size", 0)
+                                })
+                            if ep.startswith("/api/"):
+                                self.is_crosspoint = True
+                            break
+                    elif resp.status_code == 404:
+                        continue
+                except Exception as err:
+                    last_err = err
+
+            if data is None:
+                if last_err:
+                    raise last_err
+                raise Exception("Could not retrieve file list from device.")
+
             data.sort(key=lambda x: (x['type'] == 'file', x['name'].lower()))
             self.after(0, lambda: [loader.destroy(), self._render(data)])
         except Exception as e:
@@ -3413,14 +3840,19 @@ class RemoteDeviceBrowser(ctk.CTkToplevel, DnDWrapper):
 
     def _direct_upload_task(self, inputs, root_target):
         ip = self.entry_ip.get().strip()
-        base_url = f"http://{ip}"
-        is_x4 = "192.168.0.202" in ip or "192.168.3.3" in ip
+        base_url = f"http://{ip}" if not ip.startswith("http") else ip.rstrip("/")
+        is_cp = getattr(self, "is_crosspoint", False) or "crosspoint" in ip.lower() or "192.168.4.1" in ip
+        is_x4 = not is_cp and ("192.168.0.202" in ip or "192.168.3.3" in ip)
 
         # --- Helper: Create Directory ---
         def make_remote_dir(path):
-            if not path.endswith("/"): path += "/"  # Critical for X4
             try:
-                if is_x4:
+                if is_cp:
+                    parent = os.path.dirname(path.rstrip("/")) or "/"
+                    dname = os.path.basename(path.rstrip("/"))
+                    requests.post(f"{base_url}/mkdir", data={"name": dname, "path": parent}, timeout=5)
+                elif is_x4:
+                    if not path.endswith("/"): path += "/"  # Critical for X4
                     requests.put(f"{base_url}/edit", data={"path": path}, timeout=5)
                 else:
                     requests.post(f"{base_url}/mkdir", data={"name": path.strip("/"), "path": "/"}, timeout=5)
@@ -3458,25 +3890,29 @@ class RemoteDeviceBrowser(ctk.CTkToplevel, DnDWrapper):
         for i, (local, remote) in enumerate(upload_queue):
             fname = os.path.basename(local)
 
-            # This is the callback that was missing/dummy in the previous version
+            # Callback for progress
             def progress_cb(cur, tot):
                 file_pct = int((cur / tot) * 100)
-                # Format: "File 1/5: 45%"
                 self.after(0, lambda: self.lbl_status.configure(
                     text=f"File {i + 1}/{total_files}: {file_pct}%",
                     text_color="#3498DB"
                 ))
 
             try:
-                # We pass 'progress_cb' here so MultipartStreamer can report back
-                streamer = MultipartStreamer(local, 'data', remote, progress_cb)
-                headers = {'Content-Type': streamer.content_type}
+                remote_dir = os.path.dirname(remote).replace("\\", "/")
+                if not remote_dir: remote_dir = "/"
 
-                if is_x4:
+                if is_cp:
+                    streamer = MultipartStreamer(local, 'file', fname, progress_cb)
+                    headers = {'Content-Type': streamer.content_type}
+                    requests.post(f"{base_url}/upload", params={"path": remote_dir, "overwrite": "1"}, data=streamer, headers=headers, timeout=900)
+                elif is_x4:
+                    streamer = MultipartStreamer(local, 'data', remote, progress_cb)
+                    headers = {'Content-Type': streamer.content_type}
                     requests.post(f"{base_url}/edit", data=streamer, headers=headers, timeout=900)
                 else:
-                    # Non-X4 usually needs the parent path param
-                    remote_dir = os.path.dirname(remote).replace("\\", "/")
+                    streamer = MultipartStreamer(local, 'data', remote, progress_cb)
+                    headers = {'Content-Type': streamer.content_type}
                     requests.post(f"{base_url}/upload", params={"path": remote_dir}, data=streamer, headers=headers,
                                   timeout=900)
 
@@ -3497,28 +3933,46 @@ class RemoteDeviceBrowser(ctk.CTkToplevel, DnDWrapper):
 
     def delete_item(self, path):
         if messagebox.askyesno("Delete", f"Delete {os.path.basename(path)}?"):
-            threading.Thread(target=lambda: [
-                requests.delete(self.get_url("/edit"), data={"path": path}, timeout=5),
+            def _task():
+                try:
+                    if getattr(self, "is_crosspoint", False) or "crosspoint" in self.entry_ip.get().lower():
+                        requests.post(self.get_url("/delete"), data={"path": path}, timeout=5)
+                    else:
+                        requests.delete(self.get_url("/edit"), data={"path": path}, timeout=5)
+                except Exception as e:
+                    print(f"Delete failed: {e}")
                 self.after(0, self.refresh_current_path)
-            ]).start()
+            threading.Thread(target=_task).start()
 
     def rename_item(self, path, name):
         new = simpledialog.askstring("Rename", "Name:", initialvalue=name)
         if new:
-            base = os.path.dirname(path)
-            threading.Thread(target=lambda: [
-                requests.put(self.get_url("/edit"), data={"src": path, "path": f"{base}/{new}"}, timeout=5),
+            def _task():
+                try:
+                    if getattr(self, "is_crosspoint", False) or "crosspoint" in self.entry_ip.get().lower():
+                        requests.post(self.get_url("/rename"), data={"path": path, "name": new}, timeout=5)
+                    else:
+                        base = os.path.dirname(path)
+                        requests.put(self.get_url("/edit"), data={"src": path, "path": f"{base}/{new}"}, timeout=5)
+                except Exception as e:
+                    print(f"Rename failed: {e}")
                 self.after(0, self.refresh_current_path)
-            ]).start()
+            threading.Thread(target=_task).start()
 
     def create_folder(self):
         name = simpledialog.askstring("Folder", "Name:")
         if name:
-            path = f"{self.current_path}/{name}/".replace("//", "/")
-            threading.Thread(target=lambda: [
-                requests.put(self.get_url("/edit"), data={"path": path}, timeout=5),
+            def _task():
+                try:
+                    if getattr(self, "is_crosspoint", False) or "crosspoint" in self.entry_ip.get().lower():
+                        requests.post(self.get_url("/mkdir"), data={"name": name, "path": self.current_path}, timeout=5)
+                    else:
+                        path = f"{self.current_path}/{name}/".replace("//", "/")
+                        requests.put(self.get_url("/edit"), data={"path": path}, timeout=5)
+                except Exception as e:
+                    print(f"Create folder failed: {e}")
                 self.after(0, self.refresh_current_path)
-            ]).start()
+            threading.Thread(target=_task).start()
 
 
 class TransferDialog(ctk.CTkToplevel):
@@ -3667,12 +4121,18 @@ class TransferDialog(ctk.CTkToplevel):
         self.after(0, finish)
 
     def _send_raw(self, files, cb):
-        base_url = f"http://{self.ip}"
+        ip = self.ip.strip()
+        base_url = f"http://{ip}" if not ip.startswith("http") else ip.rstrip("/")
         total = len(files)
-        is_x4 = "192.168.3.3" in self.ip or "192.168.0.202" in self.ip
+        is_cp = "crosspoint" in ip.lower() or "192.168.4.1" in ip
+        is_x4 = not is_cp and ("192.168.3.3" in ip or "192.168.0.202" in ip)
 
         try:
-            if is_x4:
+            if is_cp:
+                parent = os.path.dirname(self.target_folder.rstrip("/")) or "/"
+                dname = os.path.basename(self.target_folder.rstrip("/"))
+                requests.post(f"{base_url}/mkdir", data={"name": dname, "path": parent}, timeout=5)
+            elif is_x4:
                 requests.put(f"{base_url}/edit", data={"path": self.target_folder}, timeout=5)
             else:
                 requests.post(f"{base_url}/mkdir", data={"name": self.target_folder.strip("/"), "path": "/"}, timeout=5)
@@ -3693,12 +4153,18 @@ class TransferDialog(ctk.CTkToplevel):
                     pct = (i + (cur / tot)) / total
                     cb(pct, None, current_bytes=cur, total_bytes=tot)
 
-                streamer = MultipartStreamer(f, 'data', remote, update_prog)
-                headers = {'Content-Type': streamer.content_type}
-
-                if is_x4:
+                if is_cp:
+                    streamer = MultipartStreamer(f, 'file', fname, update_prog)
+                    headers = {'Content-Type': streamer.content_type}
+                    requests.post(f"{base_url}/upload", params={"path": self.target_folder, "overwrite": "1"}, data=streamer,
+                                  headers=headers, timeout=900)
+                elif is_x4:
+                    streamer = MultipartStreamer(f, 'data', remote, update_prog)
+                    headers = {'Content-Type': streamer.content_type}
                     requests.post(f"{base_url}/edit", data=streamer, headers=headers, timeout=900)
                 else:
+                    streamer = MultipartStreamer(f, 'data', remote, update_prog)
+                    headers = {'Content-Type': streamer.content_type}
                     requests.post(f"{base_url}/upload", params={"path": self.target_folder}, data=streamer,
                                   headers=headers, timeout=900)
             except Exception as e:
@@ -3715,7 +4181,11 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         self.config = load_app_config()
 
         # 2. Initialize the Drag & Drop System
-        self.TkdndVersion = TkinterDnD._require(self)
+        try:
+            self.TkdndVersion = TkinterDnD._require(self)
+        except Exception as e:
+            print(f"[Warning] TkinterDnD initialization failed: {e}")
+            self.TkdndVersion = None
 
         # 3. Setup UI Variables using the loaded config
         self.status_filter_var = ctk.StringVar(value=self.config.get("default_status", "All Statuses"))
@@ -3843,12 +4313,17 @@ class XalibreApp(ctk.CTk, DnDWrapper):
 
     def setup_drag_and_drop(self):
         """Configure the MAIN WINDOW to accept dropped files."""
-        # Registers the entire window (self) as the drop target
-        self.drop_target_register(DND_FILES)
+        if not getattr(self, "TkdndVersion", None):
+            return
+        try:
+            # Registers the entire window (self) as the drop target
+            self.drop_target_register(DND_FILES)
 
-        self.dnd_bind('<<DragEnter>>', self.on_drag_enter)
-        self.dnd_bind('<<DragLeave>>', self.on_drag_leave)
-        self.dnd_bind('<<Drop>>', self.handle_file_drop)
+            self.dnd_bind('<<DragEnter>>', self.on_drag_enter)
+            self.dnd_bind('<<DragLeave>>', self.on_drag_leave)
+            self.dnd_bind('<<Drop>>', self.handle_file_drop)
+        except Exception as e:
+            print(f"[Warning] Main drag & drop registration failed: {e}")
 
     def on_drag_enter(self, event):
         # Visual feedback: Turn the scroll background green
@@ -3874,31 +4349,12 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         file_list = [f[0] if f[0] else f[1] for f in files]
 
         # 3. Filter and Import
-        epubs = [f for f in file_list if f.lower().endswith('.epub')]
+        epubs = [f for f in file_list if importers.is_importable(f)]
         if epubs:
             self.progress_label.configure(text=f"Importing {len(epubs)} books...")
             threading.Thread(target=lambda: self._process_imports(epubs)).start()
         else:
-            messagebox.showwarning("Invalid File", "Please drop .epub files only.")
-
-    def handle_file_drop(self, event):
-        """Parse dropped files and trigger import."""
-        # event.data contains the paths.
-        # Windows often wraps paths with spaces in {brackets}.
-        raw_data = event.data
-
-        # regex to extract paths even if they are in { }
-        files = re.findall(r'{(.*?)}|(\S+)', raw_data)
-        file_list = [f[0] if f[0] else f[1] for f in files]
-
-        # Filter for EPUBs only
-        epubs = [f for f in file_list if f.lower().endswith('.epub')]
-
-        if epubs:
-            self.progress_label.configure(text=f"Importing {len(epubs)} books...")
-            threading.Thread(target=lambda: self._process_imports(epubs)).start()
-        else:
-            messagebox.showwarning("Invalid File", "Please drop .epub files only.")
+            messagebox.showwarning("Invalid File", "Unsupported file type.\nSupported: EPUB, PDF, FB2, TXT, MOBI/AZW3, CBZ/CBR/CB7.")
 
     def toggle_view_mode(self):
         if self.view_mode == "grid":
@@ -4264,8 +4720,9 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         total_files = len(target_ids) * len(modes)
         success_count = 0
         ip = ip.strip()
-        is_x4 = "192.168.0.202" in ip or "X4" in device_type
-        base_url = f"http://{ip}"
+        is_cp = "crosspoint" in ip.lower() or "CrossPoint" in device_type or "192.168.4.1" in ip
+        is_x4 = not is_cp and ("192.168.0.202" in ip or "X4" in device_type)
+        base_url = f"http://{ip}" if not ip.startswith("http") else ip.rstrip("/")
 
         # 2. DEFINE PROGRESS HANDLER
         # If no external callback (Dialog) is provided, use the Main Window's bar
@@ -4280,7 +4737,11 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         if override_folder:
             target_folder_path = override_folder
             try:
-                if is_x4:
+                if is_cp:
+                    parent = os.path.dirname(target_folder_path.rstrip("/")) or "/"
+                    dname = os.path.basename(target_folder_path.rstrip("/"))
+                    requests.post(f"{base_url}/mkdir", data={"name": dname, "path": parent}, timeout=5)
+                elif is_x4:
                     requests.put(f"{base_url}/edit", data={"path": target_folder_path}, timeout=5)
                 else:
                     requests.post(f"{base_url}/mkdir", data={"name": target_folder_path.strip("/"), "path": "/"}, timeout=5)
@@ -4291,10 +4752,12 @@ class XalibreApp(ctk.CTk, DnDWrapper):
             for m in modes:
                 if m == "bmp": needed.add("/Covers/")
                 else: needed.add("/send-to-device/")
-            
+
             for f in needed:
                 try:
-                    if is_x4:
+                    if is_cp:
+                        requests.post(f"{base_url}/mkdir", data={"name": f.strip("/"), "path": "/"}, timeout=5)
+                    elif is_x4:
                         requests.put(f"{base_url}/edit", data={"path": f}, timeout=5)
                     else:
                         requests.post(f"{base_url}/mkdir", data={"name": f.strip("/"), "path": "/"}, timeout=5)
@@ -4304,25 +4767,28 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         # 4. TRANSFER LOOP
         for i, bid in enumerate(target_ids):
             b = next((x for x in self.all_books if x[0] == bid), None)
-            if not b: 
+            if not b:
                 # Skip progress for this book's modes
                 continue
 
             safe_title = "".join([c for c in b[1] if c.isalnum() or c in " -_"])
-            
+
             for mode in modes:
                 if override_folder:
                     target_folder_path = override_folder
                 else:
                     target_folder_path = "/Covers/" if mode == "bmp" else "/send-to-device/"
-                
+
                 if not target_folder_path.endswith("/"): target_folder_path += "/"
                 if not target_folder_path.startswith("/"): target_folder_path = "/" + target_folder_path
 
-                file_name = f"{safe_title}.{mode}"
                 src = b[4] if mode == "xtc" else b[3]
+                if mode == "xtc" and src and os.path.exists(src):
+                    file_name = os.path.basename(src)
+                else:
+                    file_name = f"{safe_title}.{mode}"
                 temp_path = None
-                
+
                 # Calculate current progress index
                 current_op_index = (i * len(modes)) + modes.index(mode)
 
@@ -4344,7 +4810,7 @@ class XalibreApp(ctk.CTk, DnDWrapper):
 
                     if img_obj:
                         try:
-                            img = ImageOps.fit(img_obj, (480, 800), method=Image.Resampling.LANCZOS,
+                            img = ImageOps.fit(img_obj, converter.ACTIVE_DEVICE_SIZE, method=Image.Resampling.LANCZOS,
                                                centering=(0.5, 0.5))
                             img = ImageEnhance.Contrast(img.convert("L")).enhance(1.6)
                             img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
@@ -4368,12 +4834,18 @@ class XalibreApp(ctk.CTk, DnDWrapper):
                             # Pass bytes to the external callback
                             progress_callback(pct, None, current_bytes=cur, total_bytes=tot)
 
-                        streamer = MultipartStreamer(src, 'data', remote_name, update_stream_prog)
-                        headers = {'Content-Type': streamer.content_type}
-
-                        if is_x4:
+                        if is_cp:
+                            streamer = MultipartStreamer(src, 'file', file_name, update_stream_prog)
+                            headers = {'Content-Type': streamer.content_type}
+                            requests.post(f"{base_url}/upload", params={"path": target_folder_path, "overwrite": "1"}, data=streamer,
+                                          headers=headers, timeout=900)
+                        elif is_x4:
+                            streamer = MultipartStreamer(src, 'data', remote_name, update_stream_prog)
+                            headers = {'Content-Type': streamer.content_type}
                             requests.post(f"{base_url}/edit", data=streamer, headers=headers, timeout=900)
                         else:
+                            streamer = MultipartStreamer(src, 'data', remote_name, update_stream_prog)
+                            headers = {'Content-Type': streamer.content_type}
                             requests.post(f"{base_url}/upload", params={"path": target_folder_path}, data=streamer,
                                           headers=headers, timeout=900)
 
@@ -4405,41 +4877,69 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         BookDetailsWindow(self, data, self.launch_editor, self.db, self.refresh_library)
 
     def import_book_dialog(self):
-        files = filedialog.askopenfilenames(filetypes=[("EPUB", "*.epub")])
+        files = filedialog.askopenfilenames(filetypes=importers.file_dialog_types())
         if files: threading.Thread(target=lambda: self._process_imports(files)).start()
 
+    def _set_import_status(self, text):
+        self.after(0, lambda: self.progress_label.configure(text=text))
+
     def _process_imports(self, files):
-        dupes = 0
+        dupes, failures = 0, []
         os.makedirs(LIBRARY_DIR, exist_ok=True)
-        for f in files:
+        for n, f in enumerate(files, 1):
+            work_dir = None
+            name = os.path.basename(f)
             try:
-                book = epub.read_epub(f)
+                self._set_import_status(f"Importing {n}/{len(files)}: {name[:40]}")
+                if importers.needs_conversion(f):
+                    work_dir = tempfile.mkdtemp(prefix="xalibre_imp_")
+                    meta = importers.convert_to_epub(
+                        f, work_dir,
+                        progress=lambda frac, msg, n=n, name=name: self._set_import_status(
+                            f"{n}/{len(files)} {name[:28]}: {msg}"))
+                    src_epub, t, a = meta["epub_path"], meta["title"], meta["author"]
+                    d = UnifiedMetadataFetcher.html_to_md(meta.get("description", ""))
+                    c = meta.get("cover")
+                elif importers.is_comic_epub(f):
+                    # comic EPUBs can be hundreds of MB: read metadata without loading every page
+                    meta = importers.read_epub_light(f)
+                    src_epub = f
+                    t = meta["title"] or os.path.splitext(name)[0]
+                    a = meta["author"] or "Unknown Author"
+                    d = UnifiedMetadataFetcher.html_to_md(meta.get("description", ""))
+                    c = meta.get("cover")
+                else:
+                    src_epub = f
+                    book = epub.read_epub(f)
 
-                def get(n, k, d=""):
+                    def get(nm, k, dflt=""):
+                        try:
+                            return str(book.get_metadata(nm, k)[0][0])
+                        except:
+                            return dflt
+
+                    t = get('DC', 'title', os.path.basename(f).replace(".epub", ""))
+                    a = get('DC', 'creator', "Unknown Author")
+                    d = UnifiedMetadataFetcher.html_to_md(get('DC', 'description', ""))
+                    c = None
                     try:
-                        return str(book.get_metadata(n, k)[0][0])
+                        c_id = book.get_metadata('OPF', 'cover')
+                        if c_id: item = book.get_item_with_id(c_id[0][1]); c = Image.open(io.BytesIO(item.get_content()))
+                        if not c:
+                            items = [x for x in book.get_items() if x.get_type() == ebooklib.ITEM_COVER]
+                            if items: c = Image.open(io.BytesIO(items[0].get_content()))
+                        if not c:
+                            for i in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+                                if 'cover' in i.get_name().lower():
+                                    c = Image.open(io.BytesIO(i.get_content()));
+                                    break
                     except:
-                        return d
+                        pass
 
-                t = get('DC', 'title', os.path.basename(f).replace(".epub", ""))
-                a = get('DC', 'creator', "Unknown Author")
                 existing = next((b for b in self.all_books if b[1] == t and b[2] == a), None)
-                if existing: dupes += 1; continue
-                d = UnifiedMetadataFetcher.html_to_md(get('DC', 'description', ""))
-                c = None
-                try:
-                    c_id = book.get_metadata('OPF', 'cover')
-                    if c_id: item = book.get_item_with_id(c_id[0][1]); c = Image.open(io.BytesIO(item.get_content()))
-                    if not c:
-                        items = [x for x in book.get_items() if x.get_type() == ebooklib.ITEM_COVER]
-                        if items: c = Image.open(io.BytesIO(items[0].get_content()))
-                    if not c:
-                        for i in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-                            if 'cover' in i.get_name().lower():
-                                c = Image.open(io.BytesIO(i.get_content()));
-                                break
-                except:
-                    pass
+                if existing:
+                    dupes += 1
+                    continue
 
                 safe_title = "".join([char for char in t if char.isalnum() or char in " -_"]).strip()
                 if not safe_title: safe_title = f"book_{int(time.time())}"
@@ -4448,13 +4948,24 @@ class XalibreApp(ctk.CTk, DnDWrapper):
                 while os.path.exists(dest_path):
                     dest_path = os.path.join(LIBRARY_DIR, f"{safe_title}_{counter}.epub")
                     counter += 1
-                shutil.copy2(f, dest_path)
+                shutil.copy2(src_epub, dest_path)
                 self.db.add_book(dest_path, t, a, d, "", "", "", c)
+            except importers.ImportProblem as e:
+                print(f"Failed to import {f}: {e}")
+                failures.append(f"{name}: {e}")
             except Exception as e:
                 print(f"Failed to import {f}: {e}")
+                failures.append(f"{name}: {e}")
+            finally:
+                if work_dir:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+        self._set_import_status("Ready")
         self.after(0, self.refresh_library)
         if dupes > 0: self.after(0, lambda: messagebox.showwarning("Duplicates",
                                                                    f"Skipped {dupes} books (already in library)."))
+        if failures:
+            msg = "\n\n".join(failures[:5]) + (f"\n\n(+{len(failures) - 5} more)" if len(failures) > 5 else "")
+            self.after(0, lambda: messagebox.showerror("Import problem", msg))
 
     def open_device_manager(self):
         """Opens Device Manager using the IP address from settings."""
@@ -4491,8 +5002,8 @@ class XalibreApp(ctk.CTk, DnDWrapper):
 
         var_device = ctk.StringVar(value="Custom / Home Network")
         device_opt = ctk.CTkOptionMenu(tab_wifi, variable=var_device,
-                                       values=["Custom / Home Network", "X4 Hotspot (192.168.3.3)",
-                                               "CrossPoint Hotspot (192.168.4.1)"])
+                                       values=["Custom / Home Network", "CrossPoint (crosspoint.local)",
+                                               "CrossPoint Hotspot (192.168.4.1)", "X4 Hotspot (192.168.3.3)"])
         device_opt.pack()
 
         ctk.CTkLabel(tab_wifi, text="IP Address:").pack(pady=(10, 2))
@@ -4506,10 +5017,12 @@ class XalibreApp(ctk.CTk, DnDWrapper):
 
         def update_ip(choice):
             entry_ip.delete(0, 'end')
-            if "X4" in choice:
-                entry_ip.insert(0, "192.168.3.3")
+            if "crosspoint.local" in choice:
+                entry_ip.insert(0, "crosspoint.local")
             elif "CrossPoint" in choice:
                 entry_ip.insert(0, "192.168.4.1")
+            elif "X4" in choice:
+                entry_ip.insert(0, "192.168.3.3")
             else:
                 # Revert to your custom default IP from settings
                 entry_ip.insert(0, self.config.get("device_ip", "192.168.0.202"))
@@ -4523,7 +5036,7 @@ class XalibreApp(ctk.CTk, DnDWrapper):
             if self.var_xtc.get(): modes.append("xtc")
             if self.var_epub.get(): modes.append("epub")
             if self.var_bmp.get(): modes.append("bmp")
-            
+
             if not modes:
                 messagebox.showwarning("Selection Error", "Please select at least one format.")
                 return
@@ -4550,7 +5063,7 @@ class XalibreApp(ctk.CTk, DnDWrapper):
             if self.var_xtc.get(): modes.append("xtc")
             if self.var_epub.get(): modes.append("epub")
             if self.var_bmp.get(): modes.append("bmp")
-            
+
             if not modes:
                 messagebox.showwarning("Selection Error", "Please select at least one format.")
                 return
@@ -4564,23 +5077,23 @@ class XalibreApp(ctk.CTk, DnDWrapper):
     def execute_send(self, modes):
         target = filedialog.askdirectory(title="Device Folder")
         if not target: return
-        
+
         if "bmp" in modes:
             os.makedirs(os.path.join(target, "Covers"), exist_ok=True)
-            
+
         cnt = 0
         for bid in self.selected_ids:
             b = next((x for x in self.all_books if x[0] == bid), None)
             if not b: continue
-            
+
             safe = "".join([c for c in b[1] if c.isalnum() or c in " -_"])
-            
+
             for mode in modes:
                 if mode == "bmp":
                     if b[5]:
                         try:
                             img = Image.open(io.BytesIO(b[5])).convert("L")
-                            img = ImageEnhance.Contrast(img).enhance(1.3).resize((480, 800)).convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+                            img = ImageEnhance.Contrast(img).enhance(1.3).resize(converter.ACTIVE_DEVICE_SIZE).convert("1", dither=Image.Dither.FLOYDSTEINBERG)
                             img.save(os.path.join(target, "Covers", f"{safe}.bmp"))
                             cnt += 1
                         except:
@@ -4593,7 +5106,7 @@ class XalibreApp(ctk.CTk, DnDWrapper):
                             cnt += 1
                         except:
                             pass
-                            
+
         messagebox.showinfo("Done", f"Sent {cnt} files.")
 
 

@@ -1,0 +1,60 @@
+# Byte-compiled / optimized / DLLs
+__pycache__/
+*.py[cod]
+*$py.class
+*.dll
+*.dylib
+*.so
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# IDEs
+.idea/
+.vscode/
+
+# Build outputs
+build/
+dist/
+dist_old/
+1507dist/
+backup/
+Nowy folder*/
+*.bak
+
+# Local databases and user configuration
+*.db
+*.sqlite
+*.sqlite3
+default_settings.json
+devices.json
+
+# Archives & temporary binaries
+*.zip
+*.rar
+*.7z
+
+# Sample media in root directory
+001-039 Star Wars Weekly*/
+/*.pdf
+/*.cbr
+/*.cbz
+/*.epub
+/*.mobi
+/*.docx
+/*.txt
+/*.webp
+/*.jpg
+/*.png
+/*.html
+!/README.md
+!/README_MAC.md
+!/requirements.txt
+
+# Keep tracked directories
+!/images/**
+!/fonts/**
+!/presets/**

@@ -1,13 +1,25 @@
-# Core Rendering & Parsing
-PyMuPDF
-Pillow
+# UI & Drag-and-Drop
+customtkinter
+tkinterdnd2
+
+# EPUB, Comic & Document Parsing
 EbookLib
 beautifulsoup4
-Pyphen
+lxml
+PyMuPDF
+mobi
+rarfile
 
-# User Interface
-customtkinter
+# Image & Math / Layout Processing
+Pillow
+numpy
+scipy
 
-# Spectra AI Annotations (Optional but recommended)
+# Text, Formatting & Device Networking
+pyphen
+requests
+
+# Optional / Advanced Features (Font Tools & AI Analysis)
+fonttools
 wordfreq
 openai
