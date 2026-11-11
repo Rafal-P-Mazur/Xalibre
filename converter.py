@@ -3325,12 +3325,11 @@ class EpubProcessor:
                 soup.body.append(cover_node)
                 soup.body["style"] = (
                     "padding: 0 !important; margin: 0 !important; height: 100%"
-                    " !important; overflow: hidden !important;"
+                    " !important; overflow: hidden !important; text-align: center !important;"
                 )
                 cover_node["style"] = (
-                    "width: 100% !important; height: 100% !important; object-fit:"
-                    " contain !important; margin: 0 !important; display: block"
-                    " !important;"
+                    "max-width: 100% !important; max-height: 100% !important; width: auto !important; height: auto !important;"
+                    " margin: 0 auto !important; display: inline-block !important;"
                 )
             # =========================================================
 
@@ -3339,16 +3338,20 @@ class EpubProcessor:
                 final_toc_titles.append(chapter['title'])
 
             body_content = "".join([str(x) for x in soup.body.contents]) if soup.body else str(soup)
-            final_html = f"<html lang='{self.book_lang}'><head><style>{patched_css}</style>{custom_css}</head><body>{body_content}</body></html>"
+            if is_cover_chapter:
+                cover_w = dev_w if ("Landscape" in orientation and self.layout_settings.get("keep_cover_portrait", True)) else self.screen_width
+                cover_h = dev_h if ("Landscape" in orientation and self.layout_settings.get("keep_cover_portrait", True)) else self.screen_height
+                cover_page_css = f"<style>@page {{ size: {cover_w}pt {cover_h}pt; margin: 0 !important; }} html, body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; height: 100% !important; text-align: center !important; }}</style>"
+                final_html = f"<html lang='{self.book_lang}'><head>{cover_page_css}</head><body>{body_content}</body></html>"
+                rect = fitz.Rect(0, 0, cover_w, cover_h)
+            else:
+                final_html = f"<html lang='{self.book_lang}'><head><style>{patched_css}</style>{custom_css}</head><body>{body_content}</body></html>"
+                rect = fitz.Rect(0, 0, self.screen_width, content_height)
 
             with open(temp_html_path, "w", encoding="utf-8") as f:
                 f.write(final_html)
 
             doc = fitz.open(temp_html_path)
-            if is_cover_chapter and ("Landscape" in orientation) and self.layout_settings.get("keep_cover_portrait", True):
-                rect = fitz.Rect(0, 0, dev_w, dev_h)
-            else:
-                rect = fitz.Rect(0, 0, self.screen_width, content_height)
             doc.layout(rect=rect)
             self._collect_mupdf_font_warnings()
             self.fitz_docs.append((doc, chapter['has_image']))
@@ -4619,7 +4622,7 @@ class EpubProcessor:
             dev_w, dev_h = get_device_size(self.layout_settings.get("device", DEFAULT_DEVICE))
             cur_w = dev_w if keep_portrait else self.screen_width
             cur_h = dev_h if keep_portrait else self.screen_height
-            cur_content_h = dev_h if keep_portrait else content_height
+            cur_content_h = cur_h if is_cover_page else (dev_h if keep_portrait else content_height)
 
             doc_idx, page_idx = self.page_map[book_idx]
             doc, _ = self.fitz_docs[doc_idx]
@@ -4635,8 +4638,26 @@ class EpubProcessor:
         # Assemble full page (Grayscale)
         full_page = Image.new("L", (cur_w, cur_h), 255)
         paste_x = (cur_w - img_content.width) // 2
-        paste_y = 0 if (is_toc or is_cover_page) else header_padding
+        paste_y = (cur_h - img_content.height) // 2 if is_cover_page else (0 if is_toc else header_padding)
         full_page.paste(img_content, (paste_x, paste_y))
+
+        # Center cover image perfectly horizontally and vertically if it doesn't fill the canvas
+        cover_centered_pos = None
+        if is_cover_page and page is not None:
+            image_info = page.get_image_info()
+            if image_info and len(image_info) > 0:
+                c_bbox = image_info[0].get('bbox')
+                if c_bbox:
+                    cx0, cy0, cx1, cy1 = [int(c_bbox[0] * sx), int(c_bbox[1] * sy), int(c_bbox[2] * sx), int(c_bbox[3] * sy)]
+                    cw = cx1 - cx0
+                    ch = cy1 - cy0
+                    if 0 < cw <= cur_w and 0 < ch <= cur_h:
+                        cover_crop = img_content.crop((cx0, cy0, cx1, cy1))
+                        target_cx = (cur_w - cw) // 2
+                        target_cy = (cur_h - ch) // 2
+                        full_page = Image.new("L", (cur_w, cur_h), 255)
+                        full_page.paste(cover_crop, (target_cx, target_cy))
+                        cover_centered_pos = (target_cx, target_cy, cw, ch)
 
         # 3. Enhance Grayscale (Global Contrast/White Clip)
         if not is_toc:
@@ -4651,14 +4672,17 @@ class EpubProcessor:
             image_info = page.get_image_info()
             for info in image_info:
                 bbox = info['bbox']
-                # Scale coordinates to match our canvas
-                ix0, iy0, ix1, iy1 = [int(bbox[0] * sx), int(bbox[1] * sy), int(bbox[2] * sx), int(bbox[3] * sy)]
-
-                # Define the crop area (accounting for page centering/padding)
-                crop_box = (ix0 + paste_x, iy0 + paste_y, ix1 + paste_x, iy1 + paste_y)
+                if is_cover_page and cover_centered_pos:
+                    tcx, tcy, cw, ch = cover_centered_pos
+                    crop_box = (tcx, tcy, tcx + cw, tcy + ch)
+                    pos = (tcx, tcy)
+                else:
+                    ix0, iy0, ix1, iy1 = [int(bbox[0] * sx), int(bbox[1] * sy), int(bbox[2] * sx), int(bbox[3] * sy)]
+                    crop_box = (ix0 + paste_x, iy0 + paste_y, ix1 + paste_x, iy1 + paste_y)
+                    pos = (ix0 + paste_x, iy0 + paste_y)
 
                 # Verify crop is valid
-                if ix1 > ix0 and iy1 > iy0:
+                if crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1]:
                     # 1. Crop the clean grayscale image
                     img_crop = full_page.crop(crop_box)
                     # 2. Lighten it slightly so e-ink doesn't get too muddy
@@ -4666,7 +4690,7 @@ class EpubProcessor:
                     # 3. Dither it to 1-bit immediately
                     img_crop = img_crop.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
                     # 4. Store for later pasting
-                    captured_images.append((img_crop, (ix0 + paste_x, iy0 + paste_y)))
+                    captured_images.append((img_crop, pos))
 
             render_mode = self.layout_settings.get("render_mode", "Threshold")
             bit_depth = self.layout_settings.get("bit_depth", "1-bit (XTG)")
