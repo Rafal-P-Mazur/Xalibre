@@ -150,7 +150,11 @@ app = BUNDLE(
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleVersion': '1.0.0',
         'CFBundlePackageType': 'APPL',
+        'CFBundleSignature': '????',
+        'CFBundleSupportedPlatforms': ['MacOSX'],
+        'LSApplicationCategoryType': 'public.app-category.utilities',
         'NSHighResolutionCapable': True,
+        'NSRequiresAquaSystemAppearance': False,
         'NSHumanReadableCopyright': '© 2026 Xalibre',
     },
 )

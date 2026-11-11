@@ -30,5 +30,18 @@ rm -rf build dist/Xalibre.app
 echo "--> Running PyInstaller..."
 pyinstaller Xalibre_mac.spec --clean --noconfirm
 
+# 5. Remove quarantine, touch bundle, and refresh LaunchServices cache
+echo "--> Stripping quarantine attributes and refreshing LaunchServices cache..."
+xattr -cr dist/Xalibre.app 2>/dev/null || true
+touch dist/Xalibre.app
+
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -f "$LSREGISTER" ]; then
+    "$LSREGISTER" -f dist/Xalibre.app 2>/dev/null || true
+fi
+
+killall Finder 2>/dev/null || true
+
 echo "=== Build Complete! ==="
 echo "Application bundle created at: dist/Xalibre.app"
+
