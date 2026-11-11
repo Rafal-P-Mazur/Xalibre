@@ -4194,6 +4194,19 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         # 4. Window Setup
         self.title("Xalibre Library Manager")
         self.geometry("1500x800")
+        for _icon_name in ("icon.ico", "images/icon.ico", "icon.png", "images/icon.png"):
+            _icon_p = get_resource_path(_icon_name)
+            if os.path.exists(_icon_p):
+                try:
+                    if _icon_name.endswith(".ico"):
+                        self.iconbitmap(_icon_p)
+                    else:
+                        from PIL import ImageTk
+                        self._icon_img = ImageTk.PhotoImage(file=_icon_p)
+                        self.wm_iconphoto(True, self._icon_img)
+                    break
+                except Exception:
+                    pass
 
         # 5. Database Setup (Uses BASE_DIR initialized at top of script)
         db_path = os.path.join(BASE_DIR, "xalibre.db")

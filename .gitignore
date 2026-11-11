@@ -58,3 +58,6 @@ devices.json
 !/images/**
 !/fonts/**
 !/presets/**
+!/icon.ico
+!/icon.png
+!/icon.icns
