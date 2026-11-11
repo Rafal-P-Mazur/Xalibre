@@ -1740,9 +1740,14 @@ def get_pil_font(font_path, size):
     try:
         if font_path and os.path.exists(font_path):
             return ImageFont.truetype(font_path, size)
-        return ImageFont.load_default()
-    except:
-        return ImageFont.load_default()
+        for f_dir in ("Fonts", "fonts"):
+            if font_path:
+                bp = os.path.join(INTERNAL_DIR, f_dir, font_path)
+                if os.path.exists(bp):
+                    return ImageFont.truetype(bp, size)
+        return None
+    except Exception:
+        return None
 
 
 def extract_all_css(book):
@@ -3478,21 +3483,106 @@ class EpubProcessor:
 
     def _get_ui_font(self, size):
         mode = self.layout_settings.get("ui_font_source", "Body Font")
-        if mode == "Body Font" and self.font_path and self.font_path != "EPUB_ORIGINAL":
-            return get_pil_font(self.font_path, size)
-        if mode == "Sans-Serif":
-            for f in ["arial.ttf", "segoeui.ttf", "helvetica.ttf", "calibri.ttf", "roboto.ttf", "DejaVuSans.ttf"]:
+
+        # 1. Body Font requested
+        if mode == "Body Font":
+            # Direct font path chosen by user
+            if self.font_path and self.font_path != "EPUB_ORIGINAL":
+                f = get_pil_font(self.font_path, size)
+                if f: return f
+
+            # When "extracted from EPUB" (self.font_path == "EPUB_ORIGINAL" or not self.font_path):
+            # Use the extracted font matching the book's body family
+            if getattr(self, 'extracted_fonts', None):
                 try:
-                    return ImageFont.truetype(f, size)
-                except:
+                    families = group_epub_fonts(self.extracted_fonts)
+                    body_family = pick_epub_body_family(families, getattr(self, 'book_css', ''))
+                    if body_family and body_family in families:
+                        face = families[body_family].get("regular") or next(iter(families[body_family].values()), None)
+                        if face:
+                            f = get_pil_font(face, size)
+                            if f: return f
+                    for fam, faces in families.items():
+                        face = faces.get("regular") or next(iter(faces.values()), None)
+                        if face:
+                            f = get_pil_font(face, size)
+                            if f: return f
+                except Exception:
                     pass
-        try:
-            return ImageFont.truetype("georgia.ttf", size)
-        except:
+
+        # Helper to search and load fonts from paths, bundled directory, or system
+        def _resolve_font(cand):
+            if not cand:
+                return None
+            if os.path.isabs(cand) and os.path.exists(cand):
+                try:
+                    return ImageFont.truetype(cand, size)
+                except Exception:
+                    return None
+            for f_dir in ("Fonts", "fonts"):
+                full_p = os.path.join(INTERNAL_DIR, f_dir, cand)
+                if os.path.exists(full_p):
+                    try:
+                        return ImageFont.truetype(full_p, size)
+                    except Exception:
+                        pass
+                f_dir_full = os.path.join(INTERNAL_DIR, f_dir)
+                if os.path.isdir(f_dir_full):
+                    cand_base = os.path.basename(cand)
+                    for root, _, files in os.walk(f_dir_full):
+                        if cand_base in files:
+                            try:
+                                return ImageFont.truetype(os.path.join(root, cand_base), size)
+                            except Exception:
+                                pass
             try:
-                return ImageFont.truetype("times.ttf", size)
-            except:
-                return ImageFont.load_default()
+                return ImageFont.truetype(cand, size)
+            except Exception:
+                return None
+
+        # 2. Sans-Serif options
+        if mode == "Sans-Serif":
+            sans_candidates = [
+                "DejavuSans-Regular.ttf",
+                "DejaVuSans.ttf",
+                "AtkinsonHyperlegible-Regular.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial.ttf",
+                "arial.ttf", "segoeui.ttf", "helvetica.ttf"
+            ]
+            for cand in sans_candidates:
+                f = _resolve_font(cand)
+                if f: return f
+
+        # 3. Serif / Fallbacks (prioritize bundled Georgia, Charis, Bookerly, Literata, etc.)
+        serif_candidates = [
+            "Georgia/georgia.ttf",
+            "Charis-Regular.ttf",
+            "Bookerly/Bookerly.ttf",
+            "DejaVuSerif.ttf",
+            "Literata/Literata-VariableFont_opsz,wght.ttf",
+            "/System/Library/Fonts/Supplemental/Georgia.ttf",
+            "/System/Library/Fonts/Times.ttc",
+            "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+            "/Library/Fonts/Georgia.ttf",
+            "georgia.ttf", "times.ttf", "times.ttc"
+        ]
+        for cand in serif_candidates:
+            f = _resolve_font(cand)
+            if f: return f
+
+        # 4. Fallback to any bundled font file
+        for f_dir in ("Fonts", "fonts"):
+            f_dir_full = os.path.join(INTERNAL_DIR, f_dir)
+            if os.path.isdir(f_dir_full):
+                for root, _, files in os.walk(f_dir_full):
+                    for file in files:
+                        if file.lower().endswith((".ttf", ".otf")):
+                            f = _resolve_font(os.path.join(root, file))
+                            if f: return f
+
+        return ImageFont.load_default()
 
     def _render_toc_pages(self, toc_entries, row_height, font_size, header_size):
         pages = []
