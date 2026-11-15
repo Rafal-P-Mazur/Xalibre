@@ -1,0 +1,40 @@
+name: Build Linux Executable
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies (Tkinter, GCC)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tk-dev gcc
+
+      - name: Build Xalibre for Linux
+        run: |
+          chmod +x build_linux.sh
+          ./build_linux.sh
+
+      - name: Package Linux binary
+        run: |
+          cd dist
+          tar -czvf Xalibre-linux-x86_64.tar.gz Xalibre
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xalibre-linux-x86_64
+          path: dist/Xalibre-linux-x86_64.tar.gz
