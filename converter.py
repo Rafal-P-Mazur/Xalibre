@@ -65,6 +65,13 @@ COMIC_MARKER = "xalibre-comic.json"
 DEVICE_PROFILES = {
     "Xteink X4 (480x800)": (480, 800),
     "Xteink X3 (528x792)": (528, 792),
+    "BOOX Picco (480x800)": (480, 800),
+    "BOOX Palma (824x1648)": (824, 1648),
+    "6\" E-Ink 300 PPI (1072x1448)": (1072, 1448),
+    "7\" E-Ink 300 PPI (1264x1680)": (1264, 1680),
+    "7.8\" E-Ink (1404x1872)": (1404, 1872),
+    "10.3\" E-Ink (1860x2480)": (1860, 2480),
+    "Custom": (480, 800),
 }
 DEFAULT_DEVICE = "Xteink X4 (480x800)"
 DEVICES_FILE = None  # set by Xalibre.py -> optional devices.json: {"My device": [w, h]}
@@ -187,13 +194,28 @@ def dither_floyd_steinberg(img_gray, two_bit=False):
     else:
         return img_gray.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
 
-def apply_eink_conversion(img_gray, render_mode="Threshold", two_bit=False, thresh=130, invert=False):
-    """Unified quantization & dithering for E-ink output (1-bit and 2-bit), with optional inversion."""
+# 16-level grayscale palette: 16 equally spaced gray shades (0, 17, 34, ..., 255)
+_PAL_16_IMG = Image.new("P", (1, 1))
+_pal16 = []
+for _i in range(16):
+    _v = int(round(_i * 255.0 / 15.0))
+    _pal16.extend([_v, _v, _v])
+_pal16 += [0] * (768 - len(_pal16))
+_PAL_16_IMG.putpalette(_pal16)
+
+def apply_eink_conversion(img_gray, render_mode="Threshold", two_bit=False, thresh=130, invert=False, four_bit=False):
+    """Unified quantization & dithering for E-ink output (1-bit, 2-bit, and 4-bit 16-grayscale), with optional inversion."""
     if img_gray.mode != "L":
         img_gray = img_gray.convert("L")
 
     mode_clean = (render_mode or "Threshold").lower()
-    if "atkinson" in mode_clean:
+    if four_bit:
+        if "floyd" in mode_clean or "dither" in mode_clean or "atkinson" in mode_clean:
+            res = img_gray.convert("RGB").quantize(palette=_PAL_16_IMG, dither=Image.Dither.FLOYDSTEINBERG).convert("L")
+        else:
+            # Nearest 16 levels: 0, 17, 34, ..., 255 (smooth anti-aliased text and clean gradients)
+            res = img_gray.convert("RGB").quantize(palette=_PAL_16_IMG, dither=Image.Dither.NONE).convert("L")
+    elif "atkinson" in mode_clean:
         res = dither_atkinson(img_gray, two_bit=two_bit)
     elif "bayer" in mode_clean or "ordered" in mode_clean:
         res = dither_bayer(img_gray, two_bit=two_bit)
@@ -360,7 +382,7 @@ def apply_bolden_to_binary(layer_bin, mode="Off", downscale_ratio=1.0):
     return layer_bin
 
 
-def apply_bubble_masked_eink(canvas, render_mode="Floyd-Steinberg", two_bit=False, thresh=130, bolden="Auto", downscale_ratio=1.0, invert=False, clean_bubbles=True, precomputed_text_mask=None):
+def apply_bubble_masked_eink(canvas, render_mode="Floyd-Steinberg", two_bit=False, thresh=130, bolden="Auto", downscale_ratio=1.0, invert=False, clean_bubbles=True, precomputed_text_mask=None, four_bit=False):
     """
     Hybrid E-ink renderer:
     - Layer A: Selected dithering algorithm (Floyd-Steinberg, Atkinson, Bayer) for artwork & screentones.
@@ -383,22 +405,21 @@ def apply_bubble_masked_eink(canvas, render_mode="Floyd-Steinberg", two_bit=Fals
 
     mode_clean = (render_mode or "Threshold").lower()
     if mode_clean in ("threshold", ""):
-        if precomputed_text_mask is not None and not two_bit:
+        if precomputed_text_mask is not None and not two_bit and not four_bit:
             out = precomputed_text_mask
         else:
-            out = apply_eink_conversion(canvas, render_mode="Threshold", two_bit=two_bit, thresh=thresh, invert=False)
-        if not two_bit:
+            out = apply_eink_conversion(canvas, render_mode="Threshold", two_bit=two_bit, thresh=thresh, invert=False, four_bit=four_bit)
+        if not two_bit and not four_bit:
             # Threshold mode already renders the whole page as pure black/white, so it's
             # safe to bolden strokes across the page (not just inside speech bubbles).
-            # Skipped for 2-bit output since it isn't pure binary (4 gray levels), where
-            # a naive 0/255 ink check would only catch the darkest level.
+            # Skipped for 2-bit and 4-bit output since they aren't pure binary.
             out = apply_bolden_to_binary(out, mode=bolden, downscale_ratio=downscale_ratio)
         if invert:
             out = ImageOps.invert(out)
         return out
 
     # 1. Layer A: Dithered artwork (uninverted initially)
-    layer_art = apply_eink_conversion(canvas, render_mode=render_mode, two_bit=two_bit, thresh=thresh, invert=False)
+    layer_art = apply_eink_conversion(canvas, render_mode=render_mode, two_bit=two_bit, thresh=thresh, invert=False, four_bit=four_bit)
 
     # 2. Text threshold selection
     t_val = 148
@@ -699,18 +720,40 @@ def load_custom_devices():
         print(f"devices.json ignored: {e}")
 
 
-def get_device_size(name):
+def get_device_size(name, custom_wh=None):
+    if custom_wh and len(custom_wh) == 2:
+        try:
+            w, h = int(custom_wh[0]), int(custom_wh[1])
+            if w > 0 and h > 0:
+                return (min(w, h), max(w, h))
+        except (ValueError, TypeError):
+            pass
+    if str(name).strip().lower() == "custom" and custom_wh:
+        try:
+            w, h = int(custom_wh[0]), int(custom_wh[1])
+            if w > 0 and h > 0:
+                return (min(w, h), max(w, h))
+        except (ValueError, TypeError):
+            pass
+    if name in DEVICE_PROFILES:
+        return DEVICE_PROFILES[name]
+    m = re.search(r"(\d+)\s*[xX×]\s*(\d+)", str(name))
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        return (min(w, h), max(w, h))
     return DEVICE_PROFILES.get(name, DEVICE_PROFILES[DEFAULT_DEVICE])
 
 
-def set_active_device(name):
+def set_active_device(name, custom_wh=None):
     """Remember the selected device size for code outside the renderer (covers etc.)."""
     global ACTIVE_DEVICE_SIZE
-    ACTIVE_DEVICE_SIZE = get_device_size(name)
+    ACTIVE_DEVICE_SIZE = get_device_size(name, custom_wh)
 
 # --- FACTORY DEFAULTS ---
 FACTORY_DEFAULTS = {
     "device": DEFAULT_DEVICE,
+    "custom_width": DEFAULT_SCREEN_WIDTH,
+    "custom_height": DEFAULT_SCREEN_HEIGHT,
     # --- COMIC / MANGA ---
     "comic_crop": "Auto",          # Off | Auto | Aggressive
     "comic_crop_pad": 1.5,         # % of page size kept around detected content
@@ -743,7 +786,7 @@ FACTORY_DEFAULTS = {
     "font_name": "",
     "preview_zoom": 380,
     "generate_toc": True,
-    "show_footnotes": False,
+    "show_footnotes": "Bottom of Page",
     "hyphenate_text": True,
 
     # --- SPECTRA AI ANNOTATIONS ---
@@ -791,7 +834,9 @@ FACTORY_DEFAULTS = {
     "ui_side_margin": 15,
 
     # --- RENDER MODES ---
-    "bit_depth": "1-bit (XTG)",
+    "output_format": "EPUB (.epub)",
+    "color_depth": "4-bit (16 Grayscale)",
+    "bit_depth": "4-bit (16 Grayscale)",
     "render_mode": "Threshold",
     "invert_colors": False,
     "white_clip": 220,
@@ -2195,45 +2240,73 @@ class EpubProcessor:
                 pass
         return id_map
 
+    def _is_valid_footnote_link(self, link, text):
+        if not text and not link.find('sup'):
+            return False
+        # Explicit EPUB3 / HTML5 footnote marker roles always count as valid
+        if 'noteref' in link.get('epub:type', '') or link.get('role') == 'doc-noteref':
+            return True
+        # Explicit backlink roles / classes should never be treated as footnote references
+        if link.get('role') == 'doc-backlink':
+            return False
+        link_classes = link.get('class', [])
+        if isinstance(link_classes, str):
+            link_classes = link_classes.split()
+        if any(c.lower() in ['footnote-backref', 'reversefootnote', 'doc-backlink'] for c in link_classes):
+            return False
+
+        # If enclosed inside an actual footnote/endnote container, skip backlinks
+        parent_classes = []
+        for parent in link.parents:
+            if parent.get('class'):
+                parent_classes.extend(parent.get('class'))
+        if any(x in [c.lower() for c in parent_classes] for x in
+               ['footnote', 'endnote', 'footnotes', 'endnotes', 'reflist']):
+            return False
+
+        css = " ".join(link_classes)
+        if any(x in css.lower() for x in ['footnote', 'noteref', 'ref']):
+            return True
+        if text:
+            clean_t = text.strip()
+            if re.match(r'^[\(\[]?\d+[\)\]]?$', clean_t) or clean_t == '*':
+                return True
+            elif re.match(r'^[\(\[]?[ivx]+[\)\]]?$', clean_t.lower()):
+                return True
+        return False
+
+    def _resolve_footnote_key_and_content(self, href, current_filename):
+        if not self.global_id_map:
+            return None, None
+        content = None
+        key = None
+        if '#' in href:
+            parts = href.rsplit('#', 1)
+            href_path = parts[0]
+            href_id = parts[1]
+            f_name = os.path.basename(href_path) if href_path else current_filename
+            key = f"{f_name}#{href_id}"
+            content = self.global_id_map.get(key)
+            if not content:
+                suffix = f"#{href_id}"
+                for k, v in self.global_id_map.items():
+                    if k.endswith(suffix):
+                        content = v
+                        key = k
+                        break
+        return key, content
+
     def _inject_inline_footnotes(self, soup, current_filename):
-        if not self.global_id_map: return soup
+        if not self.global_id_map:
+            return soup
         links = soup.find_all('a', href=True)
         for link in reversed(list(links)):
             raw_href = link['href']
             href = unquote(raw_href)
             text = link.get_text(strip=True)
-            if not text and not link.find('sup'): continue
-            parent_classes = []
-            for parent in link.parents:
-                if parent.get('class'): parent_classes.extend(parent.get('class'))
-            if any(x in [c.lower() for c in parent_classes] for x in
-                   ['footnote', 'endnote', 'reflist', 'bibliography']): continue
-            is_footnote = False
-            if 'noteref' in link.get('epub:type', '') or link.get('role') == 'doc-noteref': is_footnote = True
-            css = link.get('class', [])
-            if isinstance(css, list): css = " ".join(css)
-            if any(x in css.lower() for x in ['footnote', 'noteref', 'ref']): is_footnote = True
-            if not is_footnote and text:
-                clean_t = text.strip()
-                if re.match(r'^[\(\[]?\d+[\)\]]?$', clean_t) or clean_t == '*':
-                    is_footnote = True
-                elif re.match(r'^[\(\[]?[ivx]+[\)\]]?$', clean_t.lower()):
-                    is_footnote = True
-            if not is_footnote: continue
-            content = None
-            if '#' in href:
-                parts = href.rsplit('#', 1)
-                href_path = parts[0]
-                href_id = parts[1]
-                f_name = os.path.basename(href_path) if href_path else current_filename
-                key = f"{f_name}#{href_id}"
-                content = self.global_id_map.get(key)
-                if not content:
-                    suffix = f"#{href_id}"
-                    for k, v in self.global_id_map.items():
-                        if k.endswith(suffix):
-                            content = v
-                            break
+            if not self._is_valid_footnote_link(link, text):
+                continue
+            key, content = self._resolve_footnote_key_and_content(href, current_filename)
             if content:
                 new_marker = soup.new_tag("sup")
                 new_marker.string = text if text else "*"
@@ -2252,6 +2325,271 @@ class EpubProcessor:
                 else:
                     new_marker.insert_after(note_box)
         return soup
+
+    def _tag_footnote_links(self, soup, current_filename):
+        fn_labels = {}
+        if not self.global_id_map:
+            return soup, fn_labels
+
+        links = soup.find_all('a', href=True)
+        for link in links:
+            raw_href = link['href']
+            href = unquote(raw_href)
+            text = link.get_text(strip=True)
+            if not self._is_valid_footnote_link(link, text):
+                continue
+            key, content = self._resolve_footnote_key_and_content(href, current_filename)
+            if key and content:
+                label = text if text else "*"
+                fn_labels[key] = label
+                link['href'] = f"xtc-fn://{key}"
+                link['data-fn-label'] = label
+                link_classes = link.get('class', [])
+                if isinstance(link_classes, str):
+                    link_classes = link_classes.split()
+                if 'fn-marker' not in link_classes:
+                    link_classes.append('fn-marker')
+                link['class'] = link_classes
+                link['style'] = "text-decoration: none !important; color: black !important; font-size: 0.75em !important; line-height: 0 !important; vertical-align: super !important;"
+        return soup, fn_labels
+
+    def _layout_chapter_with_bottom_footnotes(self, final_html, fn_labels, content_height, font_face_rule, body_font_rule, img_expected_heights=None):
+        """
+        Lays out a chapter with true bottom-of-page footnotes using fitz.Story and fitz.DocumentWriter.
+        Returns a fitz.Document containing all pages for the chapter.
+        """
+        img_expected_heights = img_expected_heights or {}
+        avail_w = max(100, self.screen_width - 2 * self.margin)
+        fn_font_size = max(8, int(self.font_size * 0.78))
+        fn_line_height = max(1.1, self.line_height * 0.88)
+        fn_css = f"""
+        <style>
+            {font_face_rule}
+            body {{
+                margin: 0 !important;
+                padding: 0 {self.margin}px !important;
+                {body_font_rule}
+                font-size: {fn_font_size}pt !important;
+                line-height: {fn_line_height:.2f} !important;
+                color: black !important;
+                background-color: transparent !important;
+                text-align: {self.text_align} !important;
+            }}
+            .bottom-fn-item {{
+                margin: 0 0 3px 0 !important;
+                padding: 0 !important;
+                text-indent: 0 !important;
+            }}
+            .bottom-fn-label {{
+                font-weight: bold !important;
+                font-size: 0.85em !important;
+                vertical-align: super !important;
+                margin-right: 4px !important;
+            }}
+            .bottom-fn-content {{
+                display: inline !important;
+            }}
+            .bottom-fn-content p,
+            .bottom-fn-content div,
+            .bottom-fn-content span {{
+                display: inline !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                text-indent: 0 !important;
+            }}
+        </style>
+        """
+
+        fn_cache = {}
+        for key, label in fn_labels.items():
+            raw_content = self.global_id_map.get(key, "")
+            snippet = (
+                f"<div class='bottom-fn-item'>"
+                f"<span class='bottom-fn-label'>{label}</span>"
+                f"<span class='bottom-fn-content'>{raw_content}</span>"
+                f"</div>"
+            )
+            wrapped_fn_html = f"<html><head>{fn_css}</head><body>{snippet}</body></html>"
+            measuring_story = fitz.Story(html=wrapped_fn_html)
+            _, filled = measuring_story.place(fitz.Rect(0, 0, self.screen_width, 2000))
+            h = fitz.Rect(filled).height
+            fn_cache[key] = (h, snippet)
+
+        def _find_shrunken_img_y0(page):
+            shrunken_y = None
+            for info in page.get_image_info():
+                nat_w = info.get("width", 0)
+                nat_h = info.get("height", 0)
+                if nat_w <= 150 and nat_h <= 150:
+                    continue
+                b = info.get("bbox")
+                if not b:
+                    continue
+                h_rend = b[3] - b[1]
+                expected_h = img_expected_heights.get((nat_w, nat_h))
+                if not expected_h and nat_w > 0:
+                    expected_h = min(nat_w, avail_w) * (nat_h / nat_w)
+                if expected_h:
+                    threshold = min(expected_h, content_height * 0.85) * 0.78
+                    if h_rend < threshold:
+                        if shrunken_y is None or b[1] < shrunken_y:
+                            shrunken_y = b[1]
+            return shrunken_y
+
+        story = fitz.Story(html=final_html)
+        doc = fitz.open()
+        committed_rects = []
+
+        max_fn_area = content_height * 0.45
+        page_footnote_info = []
+        more = 1
+        pending_fns = []
+
+        while more:
+            saved_pending = list(pending_fns)
+            cap_h = content_height
+            tmp_doc = None
+            used_rect = None
+            active_fns = []
+            total_fn_h = 0
+            more_probe = 0
+
+            for attempt in range(2):
+                pending_fns = list(saved_pending)
+                full_rect = fitz.Rect(0, 0, self.screen_width, cap_h)
+                more_probe, _ = story.place(full_rect)
+                used_rect = full_rect
+
+                seen_keys = []
+                def check_seen(pos):
+                    if pos.href and pos.href.startswith("xtc-fn://"):
+                        k = pos.href[len("xtc-fn://"):]
+                        if k in fn_labels and k not in seen_keys:
+                            seen_keys.append(k)
+                story.element_positions(check_seen)
+
+                # Footnotes eligible for this page: any pending carryovers + newly seen keys
+                page_candidates = list(pending_fns)
+                for k in seen_keys:
+                    if k not in page_candidates:
+                        page_candidates.append(k)
+
+                active_fns = []
+                total_fn_h = 0
+
+                if page_candidates:
+                    local_max_fn = min(max_fn_area, cap_h * 0.45)
+                    # 1. Determine how many footnotes can fit within local_max_fn
+                    fitting_fns = []
+                    accum_h = 0
+                    for k in page_candidates:
+                        fn_h = fn_cache[k][0] + 3
+                        if accum_h + fn_h <= local_max_fn or not fitting_fns:
+                            fitting_fns.append(k)
+                            accum_h += fn_h
+                        else:
+                            break
+
+                    req_h = sum(fn_cache[k][0] for k in fitting_fns) + (len(fitting_fns) - 1) * 3 + 14
+                    req_h = min(req_h, local_max_fn)
+                    shrunk_rect = fitz.Rect(0, 0, self.screen_width, max(20, cap_h - req_h))
+                    more_probe, _ = story.place(shrunk_rect)
+                    used_rect = shrunk_rect
+
+                    # Check which new markers actually landed on this shrunk page
+                    shrunk_seen = []
+                    def check_shrunk(pos):
+                        if pos.href and pos.href.startswith("xtc-fn://"):
+                            k = pos.href[len("xtc-fn://"):]
+                            if k in fn_labels and k not in shrunk_seen:
+                                shrunk_seen.append(k)
+                    story.element_positions(check_shrunk)
+
+                    # Active footnotes: pending carryovers + newly seen markers that fit in fitting_fns
+                    active_fns = []
+                    for k in fitting_fns:
+                        if k in pending_fns or k in shrunk_seen:
+                            active_fns.append(k)
+
+                    if active_fns:
+                        total_fn_h = sum(fn_cache[k][0] for k in active_fns) + (len(active_fns) - 1) * 3 + 14
+                        total_fn_h = min(total_fn_h, max_fn_area)
+                    else:
+                        total_fn_h = 0
+
+                    # Carry over any footnotes that were seen but couldn't fit on this page
+                    new_pending = []
+                    for k in pending_fns + shrunk_seen:
+                        if k not in active_fns and k not in new_pending:
+                            new_pending.append(k)
+                    pending_fns = new_pending
+
+                tmp_stream = io.BytesIO()
+                tmp_writer = fitz.DocumentWriter(tmp_stream)
+                dev = tmp_writer.begin_page(fitz.Rect(0, 0, self.screen_width, content_height))
+                story.draw(dev)
+
+                if active_fns:
+                    fn_box_top = content_height - total_fn_h
+                    combined_items = "".join(fn_cache[k][1] for k in active_fns)
+                    fn_page_html = f"<html><head>{fn_css}</head><body>{combined_items}</body></html>"
+                    fn_story = fitz.Story(html=fn_page_html)
+                    fn_rect = fitz.Rect(0, fn_box_top + 8, self.screen_width, content_height)
+                    fn_story.place(fn_rect)
+                    fn_story.draw(dev)
+
+                tmp_writer.end_page()
+                tmp_writer.close()
+                tmp_doc = fitz.open(stream=tmp_stream.getvalue(), filetype="pdf")
+
+                if attempt == 0:
+                    shrunk_y = _find_shrunken_img_y0(tmp_doc[0])
+                    if shrunk_y is not None and shrunk_y > 20:
+                        # Rewind story to start of this page and cap height above the squeezed image
+                        story.reset()
+                        for r in committed_rects:
+                            story.place(r)
+                            story.draw(None)
+                        cap_h = max(20, shrunk_y - 2)
+                        continue
+                    elif shrunk_y is not None and shrunk_y <= 20 and active_fns:
+                        # Top-of-page image was squeezed by footnotes on this page; defer footnotes
+                        story.reset()
+                        for r in committed_rects:
+                            story.place(r)
+                            story.draw(None)
+                        pending_fns = list(saved_pending)
+                        active_fns = []
+                        total_fn_h = 0
+                        used_rect = fitz.Rect(0, 0, self.screen_width, content_height)
+                        more_probe, _ = story.place(used_rect)
+                        tmp_stream = io.BytesIO()
+                        tmp_writer = fitz.DocumentWriter(tmp_stream)
+                        dev = tmp_writer.begin_page(fitz.Rect(0, 0, self.screen_width, content_height))
+                        story.draw(dev)
+                        tmp_writer.end_page()
+                        tmp_writer.close()
+                        tmp_doc = fitz.open(stream=tmp_stream.getvalue(), filetype="pdf")
+                break
+
+            doc.insert_pdf(tmp_doc)
+            committed_rects.append(used_rect)
+            page_footnote_info.append((active_fns, total_fn_h if active_fns else 0))
+            more = more_probe or bool(pending_fns)
+
+        for page_i, (f_keys, fn_h) in enumerate(page_footnote_info):
+            if f_keys and fn_h > 0:
+                p = doc[page_i]
+                rule_y = content_height - fn_h + 4
+                rule_width = min(80, (self.screen_width - 2 * self.margin) * 0.35)
+                p.draw_line(
+                    fitz.Point(self.margin, rule_y),
+                    fitz.Point(self.margin + rule_width, rule_y),
+                    color=(0, 0, 0),
+                    width=0.6
+                )
+
+        return doc
 
     def _find_cover_image(self, book):
         # Reset so a failed lookup doesn't carry over a stale filename from
@@ -2551,7 +2889,10 @@ class EpubProcessor:
             self.line_height = line_height
 
         # 2. Orientation logic
-        dev_w, dev_h = get_device_size(self.layout_settings.get("device", DEFAULT_DEVICE))
+        dev_w, dev_h = get_device_size(
+            self.layout_settings.get("device", DEFAULT_DEVICE),
+            custom_wh=(self.layout_settings.get("custom_width"), self.layout_settings.get("custom_height"))
+        )
         if "Landscape" in orientation:
             self.screen_width = dev_h
             self.screen_height = dev_w
@@ -3042,9 +3383,11 @@ class EpubProcessor:
                         }}
 
                         /* Fix Image containers being restricted */
-                        .svg-wrapper-replaced, img {{
+                        .svg-wrapper-replaced, img, figure, .photo {{
                             max-width: 100% !important;
                             height: auto !important;
+                            page-break-inside: avoid !important;
+                            break-inside: avoid !important;
                         }}
 
                         /* ... Footnote styling  ... */
@@ -3118,8 +3461,19 @@ class EpubProcessor:
             # --- APPLY FORMATTING PROTECTION (2-arg version) ---
             soup = self._protect_formatting(soup, self.book_css)
 
-            if show_footnotes:
+            fn_mode = show_footnotes
+            if fn_mode is True:
+                fn_mode = "Bottom of Page"
+            elif fn_mode is False:
+                fn_mode = "Off"
+            elif fn_mode not in ["Bottom of Page", "Inline", "Off"]:
+                fn_mode = "Bottom of Page"
+
+            fn_labels = {}
+            if fn_mode == "Inline":
                 soup = self._inject_inline_footnotes(soup, chapter.get('filename', ''))
+            elif fn_mode == "Bottom of Page":
+                soup, fn_labels = self._tag_footnote_links(soup, chapter.get('filename', ''))
 
             if self.layout_settings.get("hyphenate_text", True):
                 soup = hyphenate_html_text(soup, self.book_lang)
@@ -3190,6 +3544,7 @@ class EpubProcessor:
             # --- IMAGE PROCESSING (SIZE DETECTION) ---
 
             # --- IMAGE PROCESSING (SIZE DETECTION) ---
+            img_expected_heights = {}
             for img_tag in soup.find_all('img'):
                 raw_src = img_tag.get('src', '')
                 if not raw_src: continue
@@ -3236,12 +3591,13 @@ class EpubProcessor:
 
                     # 3. Standard sizing logic for all other images
                     is_big_photo = False
+                    img_nat_w, img_nat_h = 0, 0
                     try:
                         b64_str = found_data.split(',', 1)[1] if ',' in found_data else found_data
                         image_bytes = base64.b64decode(b64_str)
                         with Image.open(io.BytesIO(image_bytes)) as tmp_img:
-                            w, h = tmp_img.size
-                            if w > 150 or h > 150:
+                            img_nat_w, img_nat_h = tmp_img.size
+                            if img_nat_w > 150 or img_nat_h > 150:
                                 is_big_photo = True
                     except:
                         pass
@@ -3271,13 +3627,31 @@ class EpubProcessor:
                         # block (neutralizing any % width/margin from the
                         # book's own CSS) and center the image inside it
                         # using text-align + inline-block, which IS honored.
+                        if img_nat_w > 0 and img_nat_h > 0:
+                            avail_w = max(100, self.screen_width - 2 * self.margin)
+                            tag_w = img_tag.get('width', '')
+                            w_ratio = 1.0
+                            if tag_w and str(tag_w).strip().endswith('%'):
+                                try:
+                                    w_ratio = min(1.0, max(0.2, float(str(tag_w).strip()[:-1]) / 100.0))
+                                except:
+                                    w_ratio = 1.0
+                            disp_w = min(img_nat_w, avail_w * w_ratio)
+                            est_h = disp_w * (img_nat_h / img_nat_w)
+                            prev_h = img_expected_heights.get((img_nat_w, img_nat_h))
+                            img_expected_heights[(img_nat_w, img_nat_h)] = est_h if prev_h is None else min(prev_h, est_h)
+
                         img_tag['style'] = self._append_style(
                             img_tag.get('style', ''),
-                            "display: inline-block !important; margin: 10px 0 !important; max-width: 100% !important; width: auto !important; height: auto !important; clear: both;"
+                            "display: inline-block !important; margin: 10px 0 !important; max-width: 100% !important; width: auto !important; height: auto !important; clear: both; page-break-inside: avoid !important; break-inside: avoid !important;"
                         )
 
                         parent = img_tag.parent
-                        if parent and parent.name in ['div', 'figure', 'p']:
+                        if parent and parent.name in ['div', 'figure', 'p', 'section']:
+                            parent['style'] = self._append_style(
+                                parent.get('style', ''),
+                                "page-break-inside: avoid !important; break-inside: avoid !important;"
+                            )
                             # Only center the parent container if it has no prose text siblings (e.g., captions)
                             parent_text = ''.join(c for c in parent.contents if isinstance(c, str)).strip()
                             tag_siblings = [c for c in parent.find_all(True, recursive=False) if c is not img_tag]
@@ -3344,15 +3718,29 @@ class EpubProcessor:
                 cover_page_css = f"<style>@page {{ size: {cover_w}pt {cover_h}pt; margin: 0 !important; }} html, body {{ margin: 0 !important; padding: 0 !important; width: 100% !important; height: 100% !important; text-align: center !important; }}</style>"
                 final_html = f"<html lang='{self.book_lang}'><head>{cover_page_css}</head><body>{body_content}</body></html>"
                 rect = fitz.Rect(0, 0, cover_w, cover_h)
+                with open(temp_html_path, "w", encoding="utf-8") as f:
+                    f.write(final_html)
+                doc = fitz.open(temp_html_path)
+                doc.layout(rect=rect)
+            elif fn_mode == "Bottom of Page" and fn_labels:
+                final_html = f"<html lang='{self.book_lang}'><head><style>{patched_css}</style>{custom_css}</head><body>{body_content}</body></html>"
+                with open(temp_html_path, "w", encoding="utf-8") as f:
+                    f.write(final_html)
+                doc = self._layout_chapter_with_bottom_footnotes(
+                    final_html=final_html,
+                    fn_labels=fn_labels,
+                    content_height=content_height,
+                    font_face_rule=font_face_rule,
+                    body_font_rule=body_font_rule,
+                    img_expected_heights=img_expected_heights,
+                )
             else:
                 final_html = f"<html lang='{self.book_lang}'><head><style>{patched_css}</style>{custom_css}</head><body>{body_content}</body></html>"
                 rect = fitz.Rect(0, 0, self.screen_width, content_height)
-
-            with open(temp_html_path, "w", encoding="utf-8") as f:
-                f.write(final_html)
-
-            doc = fitz.open(temp_html_path)
-            doc.layout(rect=rect)
+                with open(temp_html_path, "w", encoding="utf-8") as f:
+                    f.write(final_html)
+                doc = fitz.open(temp_html_path)
+                doc.layout(rect=rect)
             self._collect_mupdf_font_warnings()
             self.fitz_docs.append((doc, chapter['has_image']))
             current_doc_idx = len(self.fitz_docs) - 1
@@ -3482,7 +3870,10 @@ class EpubProcessor:
                 f"{len(self._font_load_failures)} font file(s) failed to load: {names}{extra}. "
                 f"MuPDF used fallback fonts.{hint}")
         for w in self.font_warnings:
-            print(f"[font warning] {w}")
+            try:
+                print(f"[font warning] {w}")
+            except UnicodeEncodeError:
+                print(f"[font warning] {w.encode('ascii', errors='replace').decode('ascii')}")
 
     def _get_ui_font(self, size):
         mode = self.layout_settings.get("ui_font_source", "Body Font")
@@ -4619,7 +5010,10 @@ class EpubProcessor:
             ori = self.layout_settings.get("orientation", "Portrait")
             is_landscape = "Landscape" in ori
             keep_portrait = is_cover_page and is_landscape and self.layout_settings.get("keep_cover_portrait", True)
-            dev_w, dev_h = get_device_size(self.layout_settings.get("device", DEFAULT_DEVICE))
+            dev_w, dev_h = get_device_size(
+                self.layout_settings.get("device", DEFAULT_DEVICE),
+                custom_wh=(self.layout_settings.get("custom_width"), self.layout_settings.get("custom_height"))
+            )
             cur_w = dev_w if keep_portrait else self.screen_width
             cur_h = dev_h if keep_portrait else self.screen_height
             cur_content_h = cur_h if is_cover_page else (dev_h if keep_portrait else content_height)
@@ -4693,15 +5087,16 @@ class EpubProcessor:
                     captured_images.append((img_crop, pos))
 
             render_mode = self.layout_settings.get("render_mode", "Threshold")
-            bit_depth = self.layout_settings.get("bit_depth", "1-bit (XTG)")
-            two_bit = "2-bit" in bit_depth
+            bit_depth = self.layout_settings.get("color_depth", self.layout_settings.get("bit_depth", "1-bit (XTG)"))
+            four_bit = "4-bit" in bit_depth or "16" in bit_depth
+            two_bit = "2-bit" in bit_depth and not four_bit
             text_blur = self.layout_settings.get("text_blur", 1.0)
             thresh = self.layout_settings.get("text_threshold", 130)
 
             if render_mode == "Threshold" and text_blur > 0:
                 full_page = ImageEnhance.Sharpness(full_page).enhance(1.0 + (text_blur * 0.5))
 
-            full_page = apply_eink_conversion(full_page, render_mode=render_mode, two_bit=two_bit, thresh=thresh, invert=False)
+            full_page = apply_eink_conversion(full_page, render_mode=render_mode, two_bit=two_bit, thresh=thresh, invert=False, four_bit=four_bit)
 
             # --- 5. RE-PASTE DITHERED IMAGES ---
             # This overwrites the "blobs" with our preserved dithered versions
@@ -5185,7 +5580,10 @@ class EpubProcessor:
         is_cover = (u["p"] == 0 and u.get("half") is None and u.get("tier_box") is None and u.get("grid", (1, 1)) == (1, 1))
         keep_portrait = is_cover and is_landscape and ls.get("keep_cover_portrait", True)
 
-        dev_w, dev_h = get_device_size(ls.get("device", DEFAULT_DEVICE))
+        dev_w, dev_h = get_device_size(
+            ls.get("device", DEFAULT_DEVICE),
+            custom_wh=(ls.get("custom_width"), ls.get("custom_height"))
+        )
         if keep_portrait:
             sw, sh = dev_w, dev_h
         else:
@@ -5324,7 +5722,9 @@ class EpubProcessor:
         bolden_mode = ls.get("comic_bolden", "Off")
         clean_bubbles = bool(ls.get("comic_clean_bubbles", False))
         render_mode = ls.get("render_mode", "Threshold")
-        two_bit = "2-bit" in ls.get("bit_depth", "1-bit (XTG)")
+        bit_depth = ls.get("color_depth", ls.get("bit_depth", "1-bit (XTG)"))
+        four_bit = "4-bit" in bit_depth or "16" in bit_depth
+        two_bit = "2-bit" in bit_depth and not four_bit
         thresh = ls.get("text_threshold", 130)
         downscale_ratio = max(w / float(nw), h / float(nh))
         bolden_active = bool(bolden_mode) and bolden_mode != "Off"
@@ -5336,7 +5736,7 @@ class EpubProcessor:
         # filter (see build_hires_text_mask) instead of relying on thresholding the
         # already-downscaled canvas further down.
         hires_text_mask = None
-        if wants_text_mask and downscale_ratio > 1.01 and not two_bit:
+        if wants_text_mask and downscale_ratio > 1.01 and not two_bit and not four_bit:
             hires_text_mask = build_hires_text_mask(im, (nw, nh), downscale_ratio, thresh=thresh)
 
         im = im.resize((nw, nh), Image.LANCZOS)
@@ -5386,9 +5786,10 @@ class EpubProcessor:
         if wants_text_mask:
             canvas = apply_bubble_masked_eink(canvas, render_mode=render_mode, two_bit=two_bit, thresh=thresh,
                                               bolden=bolden_mode, downscale_ratio=downscale_ratio, invert=should_invert,
-                                              clean_bubbles=clean_bubbles, precomputed_text_mask=hires_text_canvas)
+                                              clean_bubbles=clean_bubbles, precomputed_text_mask=hires_text_canvas,
+                                              four_bit=four_bit)
         else:
-            canvas = apply_eink_conversion(canvas, render_mode=render_mode, two_bit=two_bit, thresh=thresh, invert=should_invert)
+            canvas = apply_eink_conversion(canvas, render_mode=render_mode, two_bit=two_bit, thresh=thresh, invert=should_invert, four_bit=four_bit)
 
         out = canvas.convert("RGB")
         if strip:
@@ -5602,6 +6003,107 @@ class EpubProcessor:
             f.write(index_table)
             f.write(blob_data)
 
+    def save_epub(self, out_name, progress_callback=None):
+        if not self.is_ready: return
+
+        import importers
+
+        book_title = getattr(self, 'title_metadata', "Unknown Title") or "Unknown Title"
+        book_author = getattr(self, 'author_metadata', "Unknown Author") or "Unknown Author"
+        lang = getattr(self, 'book_lang', "en") or "en"
+        rtl = self._comic_is_rtl() if getattr(self, "is_comic", False) else False
+
+        dev_w, dev_h = get_device_size(
+            self.layout_settings.get("device", DEFAULT_DEVICE),
+            custom_wh=(self.layout_settings.get("custom_width"), self.layout_settings.get("custom_height"))
+        )
+        ori = self.layout_settings.get("orientation", "Portrait")
+        if "Landscape" in ori:
+            pw, ph = dev_h, dev_w
+        else:
+            pw, ph = dev_w, dev_h
+
+        writer = importers.EpubWriter(
+            out_name,
+            title=book_title,
+            author=book_author,
+            lang=lang,
+            rtl=rtl,
+            fixed_layout=True,
+            extra_meta=[("xalibre:rendered", "1")]
+        )
+
+        writer.add_resource(
+            "style.css",
+            (
+                "html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; }\n"
+                ".page { width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; margin: 0; padding: 0; }\n"
+                "img { display: block; margin: 0 auto; width: 100%; height: 100%; object-fit: contain; }\n"
+            ).encode("utf-8"),
+            "text/css"
+        )
+
+        toc_starts = {}
+        if hasattr(self, 'toc_data_final') and self.toc_data_final:
+            for title, start_pg in self.toc_data_final:
+                toc_starts[start_pg] = title
+
+        depth = self.layout_settings.get("color_depth", self.layout_settings.get("bit_depth", "1-bit (XTG)"))
+        is_4bit = "4-bit" in depth or "16" in depth
+        is_2bit = "2-bit" in depth and not is_4bit
+
+        for i in range(self.total_pages):
+            if progress_callback:
+                progress_callback((i + 1) / max(1, self.total_pages))
+
+            img_rgb = self.render_page(i)
+            if img_rgb is None:
+                continue
+
+            actual_w, actual_h = img_rgb.size
+            img_gray = img_rgb.convert("L")
+
+            buf = io.BytesIO()
+            if is_4bit:
+                # 16-level grayscale palette (4-bit native PNG)
+                q = img_gray.convert("RGB").quantize(palette=_PAL_16_IMG, dither=Image.Dither.NONE)
+                q.save(buf, format="PNG", optimize=True)
+            elif is_2bit:
+                img_gray.save(buf, format="PNG", optimize=True)
+            else:
+                thresh = self.layout_settings.get("text_threshold", 130)
+                img_bw = img_gray.point(lambda p: 255 if p > thresh else 0).convert("1")
+                img_bw.save(buf, format="PNG", optimize=True)
+
+            img_bytes = buf.getvalue()
+            img_href = f"images/page_{i + 1:04d}.png"
+            is_cover = (i == 0)
+
+            writer.add_resource(img_href, img_bytes, "image/png", cover=is_cover, compress=False)
+
+            pg_1based = i + 1
+            chap_title = toc_starts.get(pg_1based, None)
+            in_toc = chap_title is not None
+            page_title = chap_title if in_toc else f"Page {pg_1based}"
+
+            body = (
+                f'<div class="page">\n'
+                f'  <img src="{img_href}" alt="Page {pg_1based}" width="{actual_w}" height="{actual_h}"/>\n'
+                f'</div>'
+            )
+            head_extra = f'<meta name="viewport" content="width={actual_w}, height={actual_h}"/>'
+
+            writer.add_xhtml(
+                f"page_{i + 1:04d}.xhtml",
+                title=page_title,
+                body_html=body,
+                in_toc=in_toc,
+                head_extra=head_extra,
+                css="style.css"
+            )
+
+        writer.close()
+
 
 # --- UI COLORS ---
 COLOR_BG = "#111111"
@@ -5713,7 +6215,7 @@ class ModernApp(ctk.CTk):
         self._create_icon_btn(tb, "＋ Import EPUB", COLOR_SUCCESS, self.select_file)
         self._create_divider(tb)
         self.btn_chapters = self._create_icon_btn(tb, "☰ Edit TOC", COLOR_WARNING, self.open_chapter_dialog, "disabled")
-        self.btn_export = self._create_icon_btn(tb, "⚡ Save .XTC", COLOR_ACCENT, self.export_file, "disabled")
+        self.btn_export = self._create_icon_btn(tb, "💾 Export EPUB", COLOR_ACCENT, self.export_file, "disabled")
         self.btn_cover = self._create_icon_btn(tb, "🖼 Export Cover", "#8E44AD", self.open_cover_export, "disabled")
         self._create_divider(tb)
         self._create_icon_btn(tb, "⟲ Reset Settings", "#555", self.reset_to_factory)
@@ -5800,13 +6302,32 @@ class ModernApp(ctk.CTk):
         # --- RENDER ENGINE ---
         c_ren = SettingsCard(self.sidebar, "RENDER ENGINE")
 
-        # 1. Selection: Bit Depth / Format
+        # 1. Output Format & Color Depth
+        r_out_fmt = ctk.CTkFrame(c_ren.content, fg_color="transparent")
+        r_out_fmt.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_out_fmt, text="Output Format:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.output_format_var = ctk.StringVar(value=self.startup_settings.get("output_format", "EPUB (.epub)"))
+        self.output_format_dropdown = ctk.CTkOptionMenu(r_out_fmt, values=["EPUB (.epub)", "XTC (.xtc)"],
+                                                        variable=self.output_format_var,
+                                                        command=self.on_output_format_change, height=22, font=("Arial", 12))
+        self.output_format_dropdown.pack(side="right", fill="x", expand=True)
+
         r_depth = ctk.CTkFrame(c_ren.content, fg_color="transparent")
         r_depth.pack(fill="x", pady=2)
-        ctk.CTkLabel(r_depth, text="Target Format:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
-        self.bit_depth_var = ctk.StringVar(value=self.startup_settings.get("bit_depth", "1-bit (XTG)"))
-        ctk.CTkOptionMenu(r_depth, values=["1-bit (XTG)", "2-bit (XTH)"], variable=self.bit_depth_var,
-                          command=self.schedule_update, height=22).pack(side="right", fill="x", expand=True)
+        ctk.CTkLabel(r_depth, text="Color Depth:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        
+        is_xtc = "XTC" in self.output_format_var.get()
+        init_depth_vals = ["2-bit (XTH - 4 Grayscale)", "1-bit (XTG - Monochrome)"] if is_xtc else ["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"]
+        default_depth = "2-bit (XTH - 4 Grayscale)" if is_xtc else "4-bit (16 Grayscale)"
+        saved_depth = self.startup_settings.get("color_depth", self.startup_settings.get("bit_depth", default_depth))
+        if saved_depth not in init_depth_vals:
+            saved_depth = init_depth_vals[0]
+            
+        self.color_depth_var = ctk.StringVar(value=saved_depth)
+        self.bit_depth_var = self.color_depth_var  # backward compat
+        self.color_depth_dropdown = ctk.CTkOptionMenu(r_depth, values=init_depth_vals, variable=self.color_depth_var,
+                                                      command=self.schedule_update, height=22, font=("Arial", 12))
+        self.color_depth_dropdown.pack(side="right", fill="x", expand=True)
 
         # 2. Selection: Conversion Algorithm
         r_mode = ctk.CTkFrame(c_ren.content, fg_color="transparent")
@@ -5885,6 +6406,34 @@ class ModernApp(ctk.CTk):
 
         # --- LAYOUT ---
         c_lay = SettingsCard(self.sidebar, "PAGE LAYOUT")
+
+        r_dev = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_dev.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_dev, text="Device:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        self.device_var = ctk.StringVar(value=self.startup_settings.get("device", DEFAULT_DEVICE))
+        self.device_dropdown = ctk.CTkOptionMenu(r_dev, values=list(DEVICE_PROFILES.keys()),
+                                                 variable=self.device_var, command=self.on_device_change, height=22, font=("Arial", 12))
+        self.device_dropdown.pack(side="right", fill="x", expand=True)
+
+        r_res = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_res.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_res, text="Resolution (W×H):", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        f_res = ctk.CTkFrame(r_res, fg_color="transparent")
+        f_res.pack(side="right", fill="x", expand=True)
+        init_w = self.startup_settings.get("custom_width", get_device_size(self.device_var.get())[0])
+        init_h = self.startup_settings.get("custom_height", get_device_size(self.device_var.get())[1])
+        self.entry_res_w = ctk.CTkEntry(f_res, width=54, height=22)
+        self.entry_res_w.insert(0, str(init_w))
+        self.entry_res_w.pack(side="left", padx=(0, 4))
+        ctk.CTkLabel(f_res, text="×", width=12).pack(side="left")
+        self.entry_res_h = ctk.CTkEntry(f_res, width=54, height=22)
+        self.entry_res_h.insert(0, str(init_h))
+        self.entry_res_h.pack(side="left", padx=(4, 0))
+        self.entry_res_w.bind("<Return>", lambda e: self.on_custom_res_change())
+        self.entry_res_w.bind("<FocusOut>", lambda e: self.on_custom_res_change())
+        self.entry_res_h.bind("<Return>", lambda e: self.on_custom_res_change())
+        self.entry_res_h.bind("<FocusOut>", lambda e: self.on_custom_res_change())
+
         r_ori = ctk.CTkFrame(c_lay.content, fg_color="transparent")
         r_ori.pack(fill="x", pady=2)
         ctk.CTkLabel(r_ori, text="Orientation:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
@@ -5903,9 +6452,21 @@ class ModernApp(ctk.CTk):
         self.var_toc = ctk.BooleanVar(value=self.startup_settings["generate_toc"])
         ctk.CTkCheckBox(r_tog, text="Generate TOC", variable=self.var_toc, command=self.schedule_update,
                         font=("Arial", 12)).pack(side="left")
-        self.var_footnotes = ctk.BooleanVar(value=self.startup_settings.get("show_footnotes", True))
-        ctk.CTkCheckBox(r_tog, text="Inline Footnotes", variable=self.var_footnotes, command=self.schedule_update,
-                        font=("Arial", 12)).pack(side="right")
+
+        r_fn = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_fn.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_fn, text="Footnotes:", font=("Arial", 12), width=130, anchor="w").pack(side="left")
+        fn_startup = self.startup_settings.get("show_footnotes", "Bottom of Page")
+        if fn_startup is True:
+            fn_startup = "Bottom of Page"
+        elif fn_startup is False:
+            fn_startup = "Off"
+        elif fn_startup not in ["Bottom of Page", "Inline", "Off"]:
+            fn_startup = "Bottom of Page"
+        self.var_footnotes = ctk.StringVar(value=fn_startup)
+        ctk.CTkOptionMenu(r_fn, values=["Bottom of Page", "Inline", "Off"],
+                          variable=self.var_footnotes, command=self.schedule_update,
+                          height=22, font=("Arial", 12)).pack(side="right", fill="x", expand=True)
         self._create_slider(c_lay.content, "lbl_margin", "Side Margin", "slider_margin", 0, 100)
         self._create_slider(c_lay.content, "lbl_top_padding", "Top Padding", "slider_top_padding", 0, 150)
         self._create_slider(c_lay.content, "lbl_padding", "Bottom Padding", "slider_bottom_padding", 0, 150)
@@ -6495,19 +7056,70 @@ class ModernApp(ctk.CTk):
             pass
         self.entry_page.delete(0, 'end')
 
-    def export_file(self):
-        is_2bit = "2-bit" in self.bit_depth_var.get()
-        default_ext = ".xtch" if is_2bit else ".xtc"
-        if is_2bit:
-            filetypes = [("XTCH 2-bit files", "*.xtch"), ("XTC files", "*.xtc"), ("All files", "*.*")]
+    def on_output_format_change(self, choice):
+        if "EPUB" in choice:
+            self.color_depth_dropdown.configure(values=["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"])
+            curr = self.color_depth_var.get()
+            if "XTH" in curr or "XTG" in curr or curr not in ["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"]:
+                if "2-bit" in curr:
+                    self.color_depth_var.set("2-bit (4 Grayscale)")
+                elif "1-bit" in curr:
+                    self.color_depth_var.set("1-bit (Monochrome)")
+                else:
+                    self.color_depth_var.set("4-bit (16 Grayscale)")
+            if hasattr(self, 'btn_export'):
+                self.btn_export.configure(text="💾 Export EPUB")
         else:
-            filetypes = [("XTC files", "*.xtc"), ("XTCH 2-bit files", "*.xtch"), ("All files", "*.*")]
+            self.color_depth_dropdown.configure(values=["2-bit (XTH - 4 Grayscale)", "1-bit (XTG - Monochrome)"])
+            curr = self.color_depth_var.get()
+            if "1-bit" in curr:
+                self.color_depth_var.set("1-bit (XTG - Monochrome)")
+            else:
+                self.color_depth_var.set("2-bit (XTH - 4 Grayscale)")
+            if hasattr(self, 'btn_export'):
+                self.btn_export.configure(text="💾 Export XTC")
+        self.schedule_update()
+
+    def on_device_change(self, choice):
+        if choice in DEVICE_PROFILES and choice != "Custom":
+            w, h = DEVICE_PROFILES[choice]
+            self.entry_res_w.delete(0, 'end')
+            self.entry_res_w.insert(0, str(w))
+            self.entry_res_h.delete(0, 'end')
+            self.entry_res_h.insert(0, str(h))
+            set_active_device(choice)
+        self.schedule_update()
+
+    def on_custom_res_change(self):
+        try:
+            w = int(self.entry_res_w.get().strip())
+            h = int(self.entry_res_h.get().strip())
+            if w > 0 and h > 0:
+                self.device_var.set("Custom")
+                set_active_device("Custom", (w, h))
+                self.schedule_update()
+        except ValueError:
+            pass
+
+    def export_file(self):
+        is_epub = "EPUB" in self.output_format_var.get()
+        if is_epub:
+            default_ext = ".epub"
+            filetypes = [("EPUB Pre-rendered (*.epub)", "*.epub"), ("All files (*.*)", "*.*")]
+        else:
+            is_2bit = "2-bit" in self.color_depth_var.get()
+            default_ext = ".xtch" if is_2bit else ".xtc"
+            filetypes = [("XTC files (*.xtc)", "*.xtc"), ("XTCH 2-bit files (*.xtch)", "*.xtch"), ("All files (*.*)", "*.*")]
         path = filedialog.asksaveasfilename(defaultextension=default_ext, filetypes=filetypes)
         if path: threading.Thread(target=lambda: self._run_export(path)).start()
 
     def _run_export(self, path):
-        self.processor.save_xtc(path, progress_callback=lambda v: self.update_progress_ui(v, "Exporting"))
-        self.after(0, lambda: messagebox.showinfo("Success", "XTC file saved."))
+        if path.lower().endswith(".epub"):
+            self.processor.save_epub(path, progress_callback=lambda v: self.update_progress_ui(v, "Exporting EPUB"))
+            self.after(0, lambda: messagebox.showinfo("Success", "EPUB file saved."))
+        else:
+            self.processor.save_xtc(path, progress_callback=lambda v: self.update_progress_ui(v, "Exporting XTC"))
+            self.after(0, lambda: messagebox.showinfo("Success", "XTC file saved."))
 
     def open_cover_export(self):
         if self.processor.cover_image_obj:
@@ -6588,7 +7200,16 @@ class ModernApp(ctk.CTk):
         except (ValueError, AttributeError):
             toc_insert = 1
 
+        try:
+            custom_w = int(self.entry_res_w.get().strip())
+            custom_h = int(self.entry_res_h.get().strip())
+        except (ValueError, AttributeError):
+            custom_w, custom_h = DEFAULT_SCREEN_WIDTH, DEFAULT_SCREEN_HEIGHT
+
         return {
+            "device": self.device_var.get() if hasattr(self, 'device_var') else DEFAULT_DEVICE,
+            "custom_width": custom_w,
+            "custom_height": custom_h,
             "toc_insert_page": toc_insert,
             "font_size": int(self.slider_font_size.get()),
             "font_weight": int(self.slider_font_weight.get()),
@@ -6632,7 +7253,9 @@ class ModernApp(ctk.CTk):
             "footer_font_size": int(self.slider_footer_font_size.get()),
             "footer_margin": int(self.slider_footer_margin.get()),
             "render_mode": self.render_mode_var.get(),
-            "bit_depth": self.bit_depth_var.get(),  # Critical: 1-bit vs 2-bit
+            "output_format": self.output_format_var.get() if hasattr(self, 'output_format_var') else "EPUB (.epub)",
+            "color_depth": self.color_depth_var.get() if hasattr(self, 'color_depth_var') else "4-bit (16 Grayscale)",
+            "bit_depth": self.color_depth_var.get() if hasattr(self, 'color_depth_var') else "4-bit (16 Grayscale)",
             "invert_colors": bool(self.var_invert.get()) if hasattr(self, "var_invert") else False,
             "white_clip": int(self.slider_white_clip.get()),
             "contrast": float(self.slider_contrast.get()),
@@ -6695,8 +7318,33 @@ class ModernApp(ctk.CTk):
         if hasattr(self, 'var_toc_page'):
             self.var_toc_page.set(str(s.get("toc_insert_page", 1)))
 
+        if hasattr(self, 'device_var'):
+            dev = s.get("device", DEFAULT_DEVICE)
+            if dev not in DEVICE_PROFILES:
+                dev = "Custom"
+            self.device_var.set(dev)
+            if "custom_width" in s and "custom_height" in s:
+                self.entry_res_w.delete(0, 'end')
+                self.entry_res_w.insert(0, str(s["custom_width"]))
+                self.entry_res_h.delete(0, 'end')
+                self.entry_res_h.insert(0, str(s["custom_height"]))
+                set_active_device(dev, (s["custom_width"], s["custom_height"]))
+            elif dev in DEVICE_PROFILES:
+                w, h = DEVICE_PROFILES[dev]
+                self.entry_res_w.delete(0, 'end')
+                self.entry_res_w.insert(0, str(w))
+                self.entry_res_h.delete(0, 'end')
+                self.entry_res_h.insert(0, str(h))
+                set_active_device(dev)
+
         # --- Standard Sliders & Dropdowns ---
-        self.bit_depth_var.set(s.get("bit_depth", "1-bit (XTG)"))
+        if hasattr(self, 'output_format_var'):
+            fmt = s.get("output_format", "EPUB (.epub)")
+            self.output_format_var.set(fmt)
+            self.on_output_format_change(fmt)
+        if hasattr(self, 'color_depth_var'):
+            cd = s.get("color_depth", s.get("bit_depth", "4-bit (16 Grayscale)"))
+            self.color_depth_var.set(cd)
         self.slider_font_size.set(s['font_size'])
         self.slider_font_weight.set(s['font_weight'])
         self.slider_line_height.set(s['line_height'])
@@ -6712,7 +7360,14 @@ class ModernApp(ctk.CTk):
         self.var_hyphenate.set(s.get('hyphenate_text', True))
         self.slider_preview_zoom.set(s['preview_zoom'])
         self.var_toc.set(s['generate_toc'])
-        self.var_footnotes.set(s.get('show_footnotes', True))
+        fn_val = s.get('show_footnotes', 'Bottom of Page')
+        if fn_val is True:
+            fn_val = "Bottom of Page"
+        elif fn_val is False:
+            fn_val = "Off"
+        elif fn_val not in ["Bottom of Page", "Inline", "Off"]:
+            fn_val = "Bottom of Page"
+        self.var_footnotes.set(fn_val)
         self.slider_bar_height.set(s['bar_height'])
 
         # --- Header/Footer/Progress ---

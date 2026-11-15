@@ -23,6 +23,7 @@ import shutil
 import tempfile
 import json
 import threading
+import zipfile
 from PIL import Image, ImageEnhance, ImageOps
 import ebooklib
 from ebooklib import epub
@@ -943,8 +944,8 @@ class IntegratedEditor(ctk.CTkToplevel):
         self.btn_chapters = self._create_icon_btn(tb, "☰ Edit TOC", "#E67E22", self.open_chapter_dialog, "disabled")
 
         self.btn_font_import = self._create_icon_btn(tb, "Aa Import Font", "#34495E", self.import_custom_font)
-        # Save XTC -> Updates DB
-        self.btn_export = self._create_icon_btn(tb, "💾 Save to Library", "#2ECC71", self.save_to_library, "disabled")
+        # Save Button (updates dynamically to "Save EPUB" or "Save XTC")
+        self.btn_export = self._create_icon_btn(tb, "💾 Save EPUB", "#2ECC71", self.save_to_library, "disabled")
         self.btn_cover = self._create_icon_btn(tb, "🖼 Export Cover", "#8E44AD", self.open_cover_export, "disabled")
 
         right_f = ctk.CTkFrame(tb, fg_color="transparent")
@@ -984,12 +985,29 @@ class IntegratedEditor(ctk.CTkToplevel):
 
         # RENDER ENGINE
         c_ren = converter.SettingsCard(self.sidebar, "RENDER ENGINE")
+        r_out_fmt = ctk.CTkFrame(c_ren.content, fg_color="transparent")
+        r_out_fmt.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_out_fmt, text="Output Format:", width=130, anchor="w").pack(side="left")
+        self.output_format_var = ctk.StringVar(value=self.startup_settings.get("output_format", "EPUB (.epub)"))
+        self.output_format_dropdown = ctk.CTkOptionMenu(r_out_fmt, values=["EPUB (.epub)", "XTC (.xtc)"],
+                                                        variable=self.output_format_var,
+                                                        command=self.on_output_format_change, height=22)
+        self.output_format_dropdown.pack(side="right", fill="x", expand=True)
+
         r_depth = ctk.CTkFrame(c_ren.content, fg_color="transparent")
         r_depth.pack(fill="x", pady=2)
-        ctk.CTkLabel(r_depth, text="Target Format:", width=130, anchor="w").pack(side="left")
-        self.bit_depth_var = ctk.StringVar(value="1-bit (XTG)")
-        ctk.CTkOptionMenu(r_depth, values=["1-bit (XTG)", "2-bit (XTH)"], variable=self.bit_depth_var,
-                          command=self.schedule_update, height=22).pack(side="right", fill="x", expand=True)
+        ctk.CTkLabel(r_depth, text="Color Depth:", width=130, anchor="w").pack(side="left")
+        is_xtc = "XTC" in self.output_format_var.get()
+        init_depth_vals = ["2-bit (XTH - 4 Grayscale)", "1-bit (XTG - Monochrome)"] if is_xtc else ["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"]
+        default_depth = "2-bit (XTH - 4 Grayscale)" if is_xtc else "4-bit (16 Grayscale)"
+        saved_depth = self.startup_settings.get("color_depth", self.startup_settings.get("bit_depth", default_depth))
+        if saved_depth not in init_depth_vals:
+            saved_depth = init_depth_vals[0]
+        self.color_depth_var = ctk.StringVar(value=saved_depth)
+        self.bit_depth_var = self.color_depth_var  # backward compat
+        self.color_depth_dropdown = ctk.CTkOptionMenu(r_depth, values=init_depth_vals, variable=self.color_depth_var,
+                                                      command=self.schedule_update, height=22)
+        self.color_depth_dropdown.pack(side="right", fill="x", expand=True)
 
         ctk.CTkButton(c_pre.content, text="Set Current as Default", command=self.save_current_as_default,
                       fg_color="#444", hover_color="#3498DB", height=24).pack(fill="x", pady=(5, 0))
@@ -1074,6 +1092,24 @@ class IntegratedEditor(ctk.CTkToplevel):
         self.device_dropdown = ctk.CTkOptionMenu(r_dev, values=list(converter.DEVICE_PROFILES.keys()),
                                                  variable=self.device_var, command=self.on_device_change, height=22)
         self.device_dropdown.pack(side="right", fill="x", expand=True)
+
+        r_res = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_res.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_res, text="Resolution (W×H):", width=130, anchor="w").pack(side="left")
+        f_res = ctk.CTkFrame(r_res, fg_color="transparent")
+        f_res.pack(side="right", fill="x", expand=True)
+        init_w, init_h = converter.get_device_size(self.device_var.get())
+        self.entry_res_w = ctk.CTkEntry(f_res, width=54, height=22)
+        self.entry_res_w.insert(0, str(init_w))
+        self.entry_res_w.pack(side="left", padx=(0, 4))
+        ctk.CTkLabel(f_res, text="×", width=12).pack(side="left")
+        self.entry_res_h = ctk.CTkEntry(f_res, width=54, height=22)
+        self.entry_res_h.insert(0, str(init_h))
+        self.entry_res_h.pack(side="left", padx=(4, 0))
+        self.entry_res_w.bind("<Return>", lambda e: self.on_custom_res_change())
+        self.entry_res_w.bind("<FocusOut>", lambda e: self.on_custom_res_change())
+        self.entry_res_h.bind("<Return>", lambda e: self.on_custom_res_change())
+        self.entry_res_h.bind("<FocusOut>", lambda e: self.on_custom_res_change())
         r_ori = ctk.CTkFrame(c_lay.content, fg_color="transparent")
         r_ori.pack(fill="x", pady=2)
         ctk.CTkLabel(r_ori, text="Orientation:", width=130, anchor="w").pack(side="left")
@@ -1091,9 +1127,21 @@ class IntegratedEditor(ctk.CTkToplevel):
         self.var_toc = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(r_tog, text="Generate TOC", variable=self.var_toc, command=self.schedule_update).pack(
             side="left")
-        self.var_footnotes = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(r_tog, text="Inline Footnotes", variable=self.var_footnotes, command=self.schedule_update).pack(
-            side="right")
+
+        r_fn = ctk.CTkFrame(c_lay.content, fg_color="transparent")
+        r_fn.pack(fill="x", pady=2)
+        ctk.CTkLabel(r_fn, text="Footnotes:", width=130, anchor="w").pack(side="left")
+        fn_startup = self.startup_settings.get("show_footnotes", "Bottom of Page")
+        if fn_startup is True:
+            fn_startup = "Bottom of Page"
+        elif fn_startup is False:
+            fn_startup = "Off"
+        elif fn_startup not in ["Bottom of Page", "Inline", "Off"]:
+            fn_startup = "Bottom of Page"
+        self.var_footnotes = ctk.StringVar(value=fn_startup)
+        ctk.CTkOptionMenu(r_fn, values=["Bottom of Page", "Inline", "Off"],
+                          variable=self.var_footnotes, command=self.schedule_update,
+                          height=22).pack(side="right", fill="x", expand=True)
         self._create_slider(c_lay.content, "lbl_margin", "Side Margin", "slider_margin", 0, 100)
         self._create_slider(c_lay.content, "lbl_top_padding", "Top Padding", "slider_top_padding", 0, 150)
         self._create_slider(c_lay.content, "lbl_padding", "Bottom Padding", "slider_bottom_padding", 0, 150)
@@ -1418,6 +1466,8 @@ class IntegratedEditor(ctk.CTkToplevel):
 
         if success and self.processor.total_pages > 0:
             self.btn_export.configure(state="normal")
+            if hasattr(self, 'btn_export_epub'):
+                self.btn_export_epub.configure(state="normal")
             self.btn_cover.configure(state="normal")
 
             # Ensure we stay within bounds if the total pages decreased
@@ -1435,13 +1485,28 @@ class IntegratedEditor(ctk.CTkToplevel):
     def save_to_library(self):
         # Auto-generate destination path in EXPORT_DIR
         safe_title = "".join([c for c in self.book_data[1] if c.isalnum() or c in " -_"])
-        ext = ".xtch" if "2-bit" in self.bit_depth_var.get() else ".xtc"
-        filename = f"{safe_title}{ext}"
+        if hasattr(self, 'output_format_var') and "EPUB" in self.output_format_var.get():
+            filename = f"{safe_title}.epub"
+            out_path = os.path.join(EXPORT_DIR, filename)
+            threading.Thread(target=lambda: self._run_epub_export(out_path)).start()
+        else:
+            ext = ".xtch" if "2-bit" in self.color_depth_var.get() else ".xtc"
+            filename = f"{safe_title}{ext}"
+            out_path = os.path.join(EXPORT_DIR, filename)
+            threading.Thread(target=lambda: self._run_export(out_path)).start()
+
+    def save_epub_to_library(self):
+        safe_title = "".join([c for c in self.book_data[1] if c.isalnum() or c in " -_"])
+        filename = f"{safe_title}.epub"
         out_path = os.path.join(EXPORT_DIR, filename)
-        threading.Thread(target=lambda: self._run_export(out_path)).start()
+        threading.Thread(target=lambda: self._run_epub_export(out_path)).start()
 
     def _run_export(self, path):
-        self.processor.save_xtc(path, progress_callback=lambda v: self.update_progress_ui(v, "Exporting"))
+        self.processor.save_xtc(path, progress_callback=lambda v: self.update_progress_ui(v, "Exporting XTC"))
+        self.after(0, lambda: self._on_export_complete(path))
+
+    def _run_epub_export(self, path):
+        self.processor.save_epub(path, progress_callback=lambda v: self.update_progress_ui(v, "Exporting EPUB"))
         self.after(0, lambda: self._on_export_complete(path))
 
     def _on_export_complete(self, path):
@@ -1711,9 +1776,52 @@ class IntegratedEditor(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def on_device_change(self, choice):
-        converter.set_active_device(choice)
+    def on_output_format_change(self, choice):
+        if "EPUB" in choice:
+            self.color_depth_dropdown.configure(values=["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"])
+            curr = self.color_depth_var.get()
+            if "XTH" in curr or "XTG" in curr or curr not in ["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"]:
+                if "2-bit" in curr:
+                    self.color_depth_var.set("2-bit (4 Grayscale)")
+                elif "1-bit" in curr:
+                    self.color_depth_var.set("1-bit (Monochrome)")
+                else:
+                    self.color_depth_var.set("4-bit (16 Grayscale)")
+            if hasattr(self, 'btn_export'):
+                self.btn_export.configure(text="💾 Save EPUB")
+        else:
+            self.color_depth_dropdown.configure(values=["2-bit (XTH - 4 Grayscale)", "1-bit (XTG - Monochrome)"])
+            curr = self.color_depth_var.get()
+            if "1-bit" in curr:
+                self.color_depth_var.set("1-bit (XTG - Monochrome)")
+            else:
+                self.color_depth_var.set("2-bit (XTH - 4 Grayscale)")
+            if hasattr(self, 'btn_export'):
+                self.btn_export.configure(text="💾 Save XTC")
         self.schedule_update()
+
+    def on_device_change(self, choice):
+        if choice in converter.DEVICE_PROFILES and choice != "Custom":
+            w, h = converter.DEVICE_PROFILES[choice]
+            if hasattr(self, 'entry_res_w'):
+                self.entry_res_w.delete(0, 'end')
+                self.entry_res_w.insert(0, str(w))
+            if hasattr(self, 'entry_res_h'):
+                self.entry_res_h.delete(0, 'end')
+                self.entry_res_h.insert(0, str(h))
+            converter.set_active_device(choice)
+        self.schedule_update()
+
+    def on_custom_res_change(self):
+        try:
+            w = int(self.entry_res_w.get().strip())
+            h = int(self.entry_res_h.get().strip())
+            if w > 0 and h > 0:
+                self.device_var.set("Custom")
+                converter.set_active_device("Custom", (w, h))
+                self.schedule_update()
+        except ValueError:
+            pass
 
     def on_font_change(self, choice):
         self.processor.font_path = self.font_map[choice]
@@ -1785,6 +1893,8 @@ class IntegratedEditor(ctk.CTkToplevel):
             "orientation": self.orientation_var.get(),
             "keep_cover_portrait": self.var_keep_cover_portrait.get() if hasattr(self, 'var_keep_cover_portrait') else True,
             "device": self.device_var.get(),
+            "custom_width": int(self.entry_res_w.get().strip()) if hasattr(self, 'entry_res_w') and self.entry_res_w.get().strip().isdigit() else converter.DEFAULT_SCREEN_WIDTH,
+            "custom_height": int(self.entry_res_h.get().strip()) if hasattr(self, 'entry_res_h') and self.entry_res_h.get().strip().isdigit() else converter.DEFAULT_SCREEN_HEIGHT,
             "text_align": self.align_dropdown.get(),
             "hyphenate_text": self.var_hyphenate.get(),
             "font_name": self.font_dropdown.get(),
@@ -1833,7 +1943,9 @@ class IntegratedEditor(ctk.CTkToplevel):
             "comic_bolden": self.comic_bolden_var.get() if hasattr(self, "comic_bolden_var") else "Off",
             "comic_clean_bubbles": bool(self.comic_clean_bubbles_var.get()) if hasattr(self, "comic_clean_bubbles_var") else False,
             "render_mode": self.render_mode_var.get(),
-            "bit_depth": self.bit_depth_var.get(),
+            "output_format": self.output_format_var.get() if hasattr(self, 'output_format_var') else "EPUB (.epub)",
+            "color_depth": self.color_depth_var.get() if hasattr(self, 'color_depth_var') else "4-bit (16 Grayscale)",
+            "bit_depth": self.color_depth_var.get() if hasattr(self, 'color_depth_var') else "4-bit (16 Grayscale)",
             "invert_colors": bool(self.var_invert.get()) if hasattr(self, "var_invert") else False,
             "white_clip": int(self.slider_white_clip.get()),
             "contrast": float(self.slider_contrast.get()),
@@ -1853,7 +1965,13 @@ class IntegratedEditor(ctk.CTkToplevel):
         defaults.update(s);
         s = defaults
         if hasattr(self, 'var_toc_page'): self.var_toc_page.set(str(s.get("toc_insert_page", 1)))
-        self.bit_depth_var.set(s.get("bit_depth", "1-bit (XTG)"))
+        if hasattr(self, 'output_format_var'):
+            fmt = s.get("output_format", "EPUB (.epub)")
+            self.output_format_var.set(fmt)
+            self.on_output_format_change(fmt)
+        if hasattr(self, 'color_depth_var'):
+            cd = s.get("color_depth", s.get("bit_depth", "4-bit (16 Grayscale)"))
+            self.color_depth_var.set(cd)
         self.slider_font_size.set(s['font_size'])
         self.slider_font_weight.set(s['font_weight'])
         self.slider_line_height.set(s['line_height'])
@@ -1867,14 +1985,36 @@ class IntegratedEditor(ctk.CTkToplevel):
             self.var_keep_cover_portrait.set(s.get('keep_cover_portrait', True))
         dev = s.get("device", converter.DEFAULT_DEVICE)
         if dev not in converter.DEVICE_PROFILES:
-            dev = converter.DEFAULT_DEVICE
+            dev = "Custom"
         self.device_var.set(dev)
-        converter.set_active_device(dev)
+        if hasattr(self, 'entry_res_w') and hasattr(self, 'entry_res_h'):
+            if "custom_width" in s and "custom_height" in s:
+                self.entry_res_w.delete(0, 'end')
+                self.entry_res_w.insert(0, str(s["custom_width"]))
+                self.entry_res_h.delete(0, 'end')
+                self.entry_res_h.insert(0, str(s["custom_height"]))
+                converter.set_active_device(dev, (s["custom_width"], s["custom_height"]))
+            elif dev in converter.DEVICE_PROFILES:
+                w, h = converter.DEVICE_PROFILES[dev]
+                self.entry_res_w.delete(0, 'end')
+                self.entry_res_w.insert(0, str(w))
+                self.entry_res_h.delete(0, 'end')
+                self.entry_res_h.insert(0, str(h))
+                converter.set_active_device(dev)
+        else:
+            converter.set_active_device(dev)
         self.align_dropdown.set(s['text_align'])
         self.var_hyphenate.set(s.get('hyphenate_text', True))
         self.slider_preview_zoom.set(s['preview_zoom'])
         self.var_toc.set(s['generate_toc'])
-        self.var_footnotes.set(s.get('show_footnotes', True))
+        fn_val = s.get('show_footnotes', 'Bottom of Page')
+        if fn_val is True:
+            fn_val = "Bottom of Page"
+        elif fn_val is False:
+            fn_val = "Off"
+        elif fn_val not in ["Bottom of Page", "Inline", "Off"]:
+            fn_val = "Bottom of Page"
+        self.var_footnotes.set(fn_val)
         self.slider_bar_height.set(s['bar_height'])
         self.var_pos_title.set(s['pos_title'])
         self.var_pos_pagenum.set(s['pos_pagenum'])
@@ -2154,7 +2294,7 @@ class BatchConvertDialog(ctk.CTkToplevel):
     def __init__(self, parent, selected_ids, all_books_ref, on_process_complete):
         super().__init__(parent)
         self.title("Batch Convert")
-        self.geometry("400x350")
+        self.geometry("400x470")
         self.transient(parent)
         self.grab_set()
 
@@ -2164,10 +2304,25 @@ class BatchConvertDialog(ctk.CTkToplevel):
         self.presets = self._load_presets()
 
         ctk.CTkLabel(self, text=f"Converting {len(selected_ids)} books", font=("Arial", 16, "bold")).pack(pady=(20, 10))
-        ctk.CTkLabel(self, text="Select Preset:").pack(pady=(10, 5))
+        ctk.CTkLabel(self, text="Select Preset:").pack(pady=(5, 2))
         self.preset_var = ctk.StringVar(value="Factory Defaults")
         options = ["Factory Defaults"] + list(self.presets.keys())
-        ctk.CTkOptionMenu(self, variable=self.preset_var, values=options).pack(pady=5)
+        self.preset_dropdown = ctk.CTkOptionMenu(self, variable=self.preset_var, values=options, command=self.on_preset_change)
+        self.preset_dropdown.pack(pady=2)
+
+        ctk.CTkLabel(self, text="Output Format:").pack(pady=(8, 2))
+        self.format_var = ctk.StringVar(value="EPUB (.epub)")
+        self.format_dropdown = ctk.CTkOptionMenu(self, variable=self.format_var,
+                                                 values=["EPUB (.epub)", "XTC (.xtc)"],
+                                                 command=self.on_format_change)
+        self.format_dropdown.pack(pady=2)
+
+        ctk.CTkLabel(self, text="Color Depth:").pack(pady=(8, 2))
+        self.color_depth_var = ctk.StringVar(value="4-bit (16 Grayscale)")
+        self.depth_dropdown = ctk.CTkOptionMenu(self, variable=self.color_depth_var,
+                                                values=["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"])
+        self.depth_dropdown.pack(pady=2)
+
         self.lbl_info = ctk.CTkLabel(self, text="Ready to start.", text_color="gray")
         self.lbl_info.pack(pady=10)
         self.prog_bar = ctk.CTkProgressBar(self, width=300)
@@ -2175,6 +2330,51 @@ class BatchConvertDialog(ctk.CTkToplevel):
         self.prog_bar.pack(pady=15)
         self.btn_start = ctk.CTkButton(self, text="Start Conversion", command=self.start_process, fg_color="#27AE60")
         self.btn_start.pack(pady=10)
+
+    def on_preset_change(self, choice):
+        if choice == "Factory Defaults":
+            s = converter.FACTORY_DEFAULTS
+        else:
+            s = self.presets.get(choice, {})
+        fmt = s.get("output_format")
+        if not fmt:
+            # legacy presets might only have bit_depth like "1-bit (XTG)" or "2-bit (XTH)"
+            bd = s.get("bit_depth", "")
+            if "XT" in bd:
+                fmt = "XTC (.xtc)"
+            else:
+                fmt = "EPUB (.epub)"
+        self.format_var.set(fmt)
+        self.on_format_change(fmt)
+
+        cd = s.get("color_depth", s.get("bit_depth"))
+        if cd:
+            if "EPUB" in fmt:
+                if "4-bit" in cd: self.color_depth_var.set("4-bit (16 Grayscale)")
+                elif "2-bit" in cd: self.color_depth_var.set("2-bit (4 Grayscale)")
+                elif "1-bit" in cd: self.color_depth_var.set("1-bit (Monochrome)")
+            else:
+                if "1-bit" in cd: self.color_depth_var.set("1-bit (XTG - Monochrome)")
+                else: self.color_depth_var.set("2-bit (XTH - 4 Grayscale)")
+
+    def on_format_change(self, choice):
+        if "EPUB" in choice:
+            self.depth_dropdown.configure(values=["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"])
+            curr = self.color_depth_var.get()
+            if "XTH" in curr or "XTG" in curr or curr not in ["4-bit (16 Grayscale)", "2-bit (4 Grayscale)", "1-bit (Monochrome)"]:
+                if "2-bit" in curr:
+                    self.color_depth_var.set("2-bit (4 Grayscale)")
+                elif "1-bit" in curr:
+                    self.color_depth_var.set("1-bit (Monochrome)")
+                else:
+                    self.color_depth_var.set("4-bit (16 Grayscale)")
+        else:
+            self.depth_dropdown.configure(values=["2-bit (XTH - 4 Grayscale)", "1-bit (XTG - Monochrome)"])
+            curr = self.color_depth_var.get()
+            if "1-bit" in curr:
+                self.color_depth_var.set("1-bit (XTG - Monochrome)")
+            else:
+                self.color_depth_var.set("2-bit (XTH - 4 Grayscale)")
 
     def _load_presets(self):
         p = {}
@@ -2212,8 +2412,13 @@ class BatchConvertDialog(ctk.CTkToplevel):
 
             title = b[1]
             safe_title = "".join([c for c in title if c.isalnum() or c in " -_"])
-            ext = ".xtch" if "2-bit" in settings.get("bit_depth", "") else ".xtc"
-            path_xtc = os.path.join(EXPORT_DIR, f"{safe_title}{ext}")
+            is_epub_out = "EPUB" in self.format_var.get()
+            selected_depth = self.color_depth_var.get()
+            if is_epub_out:
+                ext = ".epub"
+            else:
+                ext = ".xtch" if "2-bit" in selected_depth else ".xtc"
+            path_out = os.path.join(EXPORT_DIR, f"{safe_title}{ext}")
 
             self.update_ui(i, total, f"Converting: {title[:20]}...")
 
@@ -2222,6 +2427,9 @@ class BatchConvertDialog(ctk.CTkToplevel):
                 if not proc.parse_book_structure(path_epub): continue
 
                 book_settings = dict(settings)
+                book_settings["output_format"] = self.format_var.get()
+                book_settings["color_depth"] = selected_depth
+                book_settings["bit_depth"] = selected_depth
                 if proc.is_comic and book_settings.get("render_mode") == "Threshold":
                     book_settings["render_mode"] = "Floyd-Steinberg"   # comics need dithering; same default as the editor
 
@@ -2253,15 +2461,17 @@ class BatchConvertDialog(ctk.CTkToplevel):
                     text_align=settings['text_align'],
                     orientation=settings['orientation'],
                     add_toc=settings['generate_toc'],
-                    show_footnotes=settings.get('show_footnotes', True),
+                    show_footnotes=settings.get('show_footnotes', 'Bottom of Page'),
                     layout_settings=book_settings
                 )
 
-                proc.save_xtc(path_xtc)
+                if is_epub_out:
+                    proc.save_epub(path_out)
+                else:
+                    proc.save_xtc(path_out)
 
-                # FIX: Explicitly capture bid and path_xtc in the lambda default args
-                # We use app_db directly here if thread-safe, or schedule it on main thread
-                self.after(0, lambda b_id=bid, p_xtc=path_xtc: app_db.update_xtc_path(b_id, p_xtc))
+                # FIX: Explicitly capture bid and path_out in the lambda default args
+                self.after(0, lambda b_id=bid, p_out=path_out: app_db.update_xtc_path(b_id, p_out))
 
             except Exception as e:
                 print(f"Error converting {title}: {e}")
@@ -2280,17 +2490,24 @@ class BatchConvertDialog(ctk.CTkToplevel):
 # --- FILE BADGE ---
 class FileBadge(ctk.CTkFrame):
     def __init__(self, parent, text, color, on_delete_click, scroll_callback):
-        # Auto-width: 60px for 5+ chars (e.g. ".EPUB", "2-BIT"), 55px for short ones (".XTC")
-        w = 60 if len(text) >= 5 else 55
+        # Compact width: ensures multiple badges fit neatly on cards without expanding them
+        if len(text) >= 7:
+            w = 50
+        elif len(text) >= 5:
+            w = 42
+        elif len(text) >= 4:
+            w = 38
+        else:
+            w = 32
 
-        super().__init__(parent, fg_color=color, corner_radius=6, height=22, width=w)
+        super().__init__(parent, fg_color=color, corner_radius=5, height=20, width=w)
         self.on_delete_click = on_delete_click
         self.pack_propagate(False)
 
-        self.lbl = ctk.CTkLabel(self, text=text, text_color="white", font=("Arial", 9, "bold"))
+        self.lbl = ctk.CTkLabel(self, text=text, text_color="white", font=("Arial", 8, "bold"))
         self.lbl.place(relx=0.5, rely=0.5, anchor="center")
 
-        self.lbl_x = ctk.CTkLabel(self, text="✕", text_color="white", font=("Arial", 10, "bold"), fg_color=color)
+        self.lbl_x = ctk.CTkLabel(self, text="✕", text_color="white", font=("Arial", 9, "bold"), fg_color=color)
         self.lbl_x.bind("<Button-1>", self._delete)
         self.lbl_x.bind("<Enter>", lambda e: self.lbl_x.configure(text_color="#C0392B"))
         self.lbl_x.bind("<Leave>", lambda e: self.lbl_x.configure(text_color="white"))
@@ -2304,8 +2521,8 @@ class FileBadge(ctk.CTkFrame):
             w.bind("<Button-5>", scroll_callback)
 
     def _on_enter(self, event):
-        self.lbl.place(relx=0.35, rely=0.5, anchor="center")
-        self.lbl_x.place(relx=0.8, rely=0.5, anchor="center")
+        self.lbl.place(relx=0.30, rely=0.5, anchor="center")
+        self.lbl_x.place(relx=0.80, rely=0.5, anchor="center")
 
     def _on_leave(self, event):
         try:
@@ -2463,21 +2680,27 @@ class BookDetailsWindow(ctk.CTkToplevel):
         else:
             ctk.CTkLabel(f_epub, text="Missing", text_color="#C0392B", font=("Arial", 12, "bold")).pack(anchor="w")
 
-        ctk.CTkFrame(files_frame, width=1, fg_color="#333").pack(side="left", fill="y", pady=10)
-
-        # XTC
-        f_xtc = ctk.CTkFrame(files_frame, fg_color="transparent")
-        f_xtc.pack(side="left", fill="y", padx=20, pady=2)
-        ctk.CTkLabel(f_xtc, text="CONVERTED FILE", font=("Arial", 10, "bold"), text_color="#666").pack(anchor="w",
-                                                                                                       pady=(10, 0))
-
-        xtc_path = curr[4]
-        if xtc_path and os.path.exists(xtc_path):
-            btn = ctk.CTkButton(f_xtc, text="🖼 Open XTC", height=22, width=100, fg_color="transparent",
-                                border_width=1, border_color="#2ECC71", text_color="#2ECC71", hover_color="#333",
-                                command=lambda: XtcBookViewer(self, xtc_path))
-            btn.pack(anchor="w")
+        # Converted / Exported Files
+        exports = get_book_export_files(curr)
+        if exports:
+            for exp_path, exp_type in exports:
+                ctk.CTkFrame(files_frame, width=1, fg_color="#333").pack(side="left", fill="y", pady=10)
+                f_exp = ctk.CTkFrame(files_frame, fg_color="transparent")
+                f_exp.pack(side="left", fill="y", padx=20, pady=2)
+                lbl_text, badge_color = detect_xtc_version(exp_path)
+                header_title = "CONVERTED EPUB" if exp_type == "epub_export" else "CONVERTED XTC"
+                ctk.CTkLabel(f_exp, text=header_title, font=("Arial", 10, "bold"), text_color="#666").pack(anchor="w", pady=(10, 0))
+                btn_cmd = (lambda p=exp_path: SimpleEpubReader(self, p, curr[1])) if exp_type == "epub_export" else (lambda p=exp_path: XtcBookViewer(self, p))
+                btn_icon = "📖" if exp_type == "epub_export" else "🖼"
+                btn = ctk.CTkButton(f_exp, text=f"{btn_icon} Open {lbl_text}", height=22, width=110, fg_color="transparent",
+                                    border_width=1, border_color=badge_color, text_color=badge_color, hover_color="#333",
+                                    command=btn_cmd)
+                btn.pack(anchor="w")
         else:
+            ctk.CTkFrame(files_frame, width=1, fg_color="#333").pack(side="left", fill="y", pady=10)
+            f_xtc = ctk.CTkFrame(files_frame, fg_color="transparent")
+            f_xtc.pack(side="left", fill="y", padx=20, pady=2)
+            ctk.CTkLabel(f_xtc, text="CONVERTED FILE", font=("Arial", 10, "bold"), text_color="#666").pack(anchor="w", pady=(10, 0))
             ctk.CTkLabel(f_xtc, text="Not Converted", text_color="gray", font=("Arial", 12)).pack(anchor="w")
 
         # Tabs
@@ -2990,13 +3213,43 @@ class XtcBookViewer(ctk.CTkToplevel):
 
 def detect_xtc_version(filepath):
     """
-    Inspects an XTC file to determine if it is 1-bit or 2-bit.
+    Inspects an XTC or converted EPUB file to determine if it is 1-bit, 2-bit, or 4-bit.
     Returns a tuple: (Label Text, Badge Color)
     """
     default = (".XTC", "#2ECC71")  # Default Green
 
     if not filepath or not os.path.exists(filepath):
         return default
+
+    if filepath.lower().endswith(".epub"):
+        try:
+            with zipfile.ZipFile(filepath, "r") as zf:
+                for name in zf.namelist():
+                    if ("images/" in name.lower() or name.lower().startswith("oebps/")) and name.lower().endswith((".png", ".jpg", ".jpeg")):
+                        data = zf.read(name)
+                        im = Image.open(io.BytesIO(data))
+                        if im.mode == "1":
+                            return ("EPUB 1B", "#8E44AD")
+                        elif im.mode == "P":
+                            pal = im.getpalette() or []
+                            n_colors = len(pal) // 3
+                            if n_colors <= 2:
+                                return ("EPUB 1B", "#8E44AD")
+                            elif n_colors <= 4:
+                                return ("EPUB 2B", "#9B59B6")
+                            return ("EPUB 4B", "#6C3483")
+                        elif im.mode == "L":
+                            colors = im.getcolors(maxcolors=256)
+                            n_colors = len(colors) if colors else 256
+                            if n_colors <= 2:
+                                return ("EPUB 1B", "#8E44AD")
+                            elif n_colors <= 4:
+                                return ("EPUB 2B", "#9B59B6")
+                            return ("EPUB 4B", "#6C3483")
+                        break
+        except Exception:
+            pass
+        return ("EPUB", "#9B59B6")
 
     try:
         with open(filepath, "rb") as f:
@@ -3035,6 +3288,43 @@ def detect_xtc_version(filepath):
         return default
 
 
+def get_book_export_files(book_data):
+    """
+    Returns a list of all existing converted/exported files associated with a book.
+    Discovers files from book_data[4] (explicit path in DB) as well as any matching
+    .xtc, .xtch, or converted .epub in EXPORT_DIR sharing the book title.
+    Returns list of tuples: [(filepath, format_type), ...]
+    where format_type is 'xtc' or 'epub_export'.
+    """
+    files = []
+    seen = set()
+
+    # 1. Check path stored in DB (index 4)
+    if len(book_data) > 4 and book_data[4] and os.path.exists(book_data[4]):
+        p = os.path.normpath(os.path.abspath(book_data[4]))
+        seen.add(p.lower())
+        ftype = "epub_export" if p.lower().endswith(".epub") else "xtc"
+        files.append((p, ftype))
+
+    # 2. Check for other exports matching the book title in EXPORT_DIR
+    title = book_data[1] if len(book_data) > 1 and book_data[1] else ""
+    if title and os.path.exists(EXPORT_DIR):
+        safe_title = "".join([c for c in title if c.isalnum() or c in " -_"]).strip()
+        candidates = [
+            (os.path.join(EXPORT_DIR, f"{safe_title}.xtc"), "xtc"),
+            (os.path.join(EXPORT_DIR, f"{safe_title}.xtch"), "xtc"),
+            (os.path.join(EXPORT_DIR, f"{safe_title}.epub"), "epub_export"),
+        ]
+        for c_path, c_ftype in candidates:
+            if os.path.exists(c_path):
+                norm = os.path.normpath(os.path.abspath(c_path))
+                if norm.lower() not in seen:
+                    seen.add(norm.lower())
+                    files.append((norm, c_ftype))
+
+    return files
+
+
 # --- BOOK CARD ---
 class BookCard(ctk.CTkFrame, DnDWrapper):
     def __init__(self, parent, book_data, on_convert, on_details, on_delete, on_select, on_delete_file,
@@ -3053,27 +3343,29 @@ class BookCard(ctk.CTkFrame, DnDWrapper):
         # 1. Header Frame
         h = ctk.CTkFrame(self, fg_color="transparent", height=24)
         h.pack(fill="x", padx=8, pady=(8, 0))
+        h.pack_propagate(False)
 
         # Checkbox
         ctk.CTkCheckBox(h, text="", width=20, variable=self.var,
                         command=lambda: on_select(book_data[0], self.var.get())).pack(side="left")
 
         # 2. Badges Container (.XTC / .EPUB)
-        badges = ctk.CTkFrame(self, fg_color="transparent")
-        badges.place(relx=0.97, rely=0.02, anchor="ne")
+        badges = ctk.CTkFrame(h, fg_color="transparent")
+        badges.pack(side="right", padx=(5, 0))
 
-        path_xtc = book_data[4]
+        # Show source file badge first
         path_epub = book_data[3]
-
-        if path_xtc and os.path.exists(path_xtc):
-            # DETECT VERSION
-            xtc_label, xtc_color = detect_xtc_version(path_xtc)
-            FileBadge(badges, xtc_label, xtc_color, lambda: on_delete_file(book_data[0], "xtc"), scroll_cb).pack(
-                side="right", padx=2)
-
         if path_epub and os.path.exists(path_epub):
-            FileBadge(badges, ".EPUB", "#E67E22", lambda: on_delete_file(book_data[0], "epub"), scroll_cb).pack(
-                side="right", padx=2)
+            ext = os.path.splitext(path_epub)[1].upper() or ".EPUB"
+            FileBadge(badges, ext, "#E67E22", lambda: on_delete_file(book_data[0], "epub", path_epub), scroll_cb).pack(
+                side="left", padx=1)
+
+        # Show all converted/exported files (XTC, XTCH, converted EPUB)
+        export_files = get_book_export_files(book_data)
+        for exp_path, exp_type in export_files:
+            lbl, col = detect_xtc_version(exp_path)
+            FileBadge(badges, lbl, col, lambda p=exp_path, t=exp_type: on_delete_file(book_data[0], t, p), scroll_cb).pack(
+                side="left", padx=1)
 
         # 3. Content Frame (Cover Image)
         self.c_f = ctk.CTkFrame(self, fg_color="transparent")
@@ -3180,8 +3472,8 @@ class BookCard(ctk.CTkFrame, DnDWrapper):
                 if not curr: break
                 try:
                     txt = str(curr.cget("text"))
-                    if ".EPUB" in txt: return "epub"
-                    # FIX: Check for 1-BIT and 2-BIT labels as well as .XTC
+                    if txt == ".EPUB": return "epub_source"
+                    if "EPUB" in txt: return "epub_export"
                     if ".XTC" in txt or "1-BIT" in txt or "2-BIT" in txt: return "xtc"
                 except:
                     pass
@@ -3250,10 +3542,18 @@ class BookCard(ctk.CTkFrame, DnDWrapper):
                     except:
                         pass
 
-        elif mode in ["epub", "xtc"]:
-            idx = 3 if mode == "epub" else 4
+        elif mode == "epub_source":
             for b in books:
-                if b[idx] and os.path.exists(b[idx]): files.append(b[idx])
+                if b[3] and os.path.exists(b[3]): files.append(b[3])
+
+        elif mode in ["epub_export", "xtc"]:
+            for b in books:
+                exports = get_book_export_files(b)
+                matching = [p for p, t in exports if (t == "epub_export" if mode == "epub_export" else t == "xtc")]
+                if matching:
+                    files.append(matching[0])
+                elif b[4] and os.path.exists(b[4]):
+                    files.append(b[4])
 
         if files:
             return (('copy',), (DND_FILES,), tuple(files))
@@ -3353,15 +3653,18 @@ class BookRow(ctk.CTkFrame, DnDWrapper):
         badge_frame = ctk.CTkFrame(self, fg_color="transparent")
         badge_frame.grid(row=0, column=3, padx=10)
 
-        if book_data[4] and os.path.exists(book_data[4]):
-            # DETECT VERSION
-            xtc_label, xtc_color = detect_xtc_version(book_data[4])
-            FileBadge(badge_frame, xtc_label, xtc_color, lambda: on_delete_file(book_data[0], "xtc"), scroll_cb).pack(
-                side="left", padx=2)
-
+        # Show source file badge first
         if book_data[3] and os.path.exists(book_data[3]):
-            FileBadge(badge_frame, ".EPUB", "#E67E22", lambda: on_delete_file(book_data[0], "epub"), scroll_cb).pack(
-                side="left", padx=2)
+            ext = os.path.splitext(book_data[3])[1].upper() or ".EPUB"
+            FileBadge(badge_frame, ext, "#E67E22", lambda: on_delete_file(book_data[0], "epub", book_data[3]), scroll_cb).pack(
+                side="left", padx=1)
+
+        # Show all converted/exported files (XTC, XTCH, converted EPUB)
+        export_files = get_book_export_files(book_data)
+        for exp_path, exp_type in export_files:
+            lbl, col = detect_xtc_version(exp_path)
+            FileBadge(badge_frame, lbl, col, lambda p=exp_path, t=exp_type: on_delete_file(book_data[0], t, p), scroll_cb).pack(
+                side="left", padx=1)
         # 5. Status
         status_val = book_data[12] if len(book_data) > 12 else "Unread"
         if status_val not in ["Unread", "Reading", "Finished"]: status_val = "Unread"
@@ -3431,8 +3734,8 @@ class BookRow(ctk.CTkFrame, DnDWrapper):
                 if not curr: break
                 try:
                     txt = str(curr.cget("text"))
-                    if ".EPUB" in txt: return "epub"
-                    # FIX: Check for 1-BIT and 2-BIT labels as well as .XTC
+                    if txt == ".EPUB": return "epub_source"
+                    if "EPUB" in txt: return "epub_export"
                     if ".XTC" in txt or "1-BIT" in txt or "2-BIT" in txt: return "xtc"
                 except:
                     pass
@@ -3497,10 +3800,18 @@ class BookRow(ctk.CTkFrame, DnDWrapper):
                         files.append(out)
                     except:
                         pass
-        elif mode in ["epub", "xtc"]:
-            idx = 3 if mode == "epub" else 4
+        elif mode == "epub_source":
             for b in books:
-                if b[idx] and os.path.exists(b[idx]): files.append(b[idx])
+                if b[3] and os.path.exists(b[3]): files.append(b[3])
+
+        elif mode in ["epub_export", "xtc"]:
+            for b in books:
+                exports = get_book_export_files(b)
+                matching = [p for p, t in exports if (t == "epub_export" if mode == "epub_export" else t == "xtc")]
+                if matching:
+                    files.append(matching[0])
+                elif b[4] and os.path.exists(b[4]):
+                    files.append(b[4])
 
         if files:
             return (('copy',), (DND_FILES,), tuple(files))
@@ -4501,11 +4812,11 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         for w in self.scroll.winfo_children(): w.destroy()
 
         # Reset Grid Configuration
-        for i in range(50): self.scroll.grid_columnconfigure(i, weight=0)
+        for i in range(50): self.scroll.grid_columnconfigure(i, weight=0, uniform="")
 
         if self.view_mode == "grid":
             # --- GRID LOGIC ---
-            for i in range(self.cols): self.scroll.grid_columnconfigure(i, weight=1)
+            for i in range(self.cols): self.scroll.grid_columnconfigure(i, weight=1, uniform="card_col")
 
             current_row = 0
             for group_name, books in self.grouped_data.items():
@@ -4533,7 +4844,8 @@ class XalibreApp(ctk.CTk, DnDWrapper):
 
         else:
             # --- LIST LOGIC ---
-            self.scroll.grid_columnconfigure(0, weight=1)  # One wide column
+            for i in range(50): self.scroll.grid_columnconfigure(i, weight=0, uniform="")
+            self.scroll.grid_columnconfigure(0, weight=1, uniform="")  # One wide column
 
             current_row = 0
             for group_name, books in self.grouped_data.items():
@@ -4564,8 +4876,8 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         for w in self.scroll.winfo_children(): w.destroy()
 
         if self.view_mode == "grid":
-            for i in range(50): self.scroll.grid_columnconfigure(i, weight=0)
-            for i in range(self.cols): self.scroll.grid_columnconfigure(i, weight=1)
+            for i in range(50): self.scroll.grid_columnconfigure(i, weight=0, uniform="")
+            for i in range(self.cols): self.scroll.grid_columnconfigure(i, weight=1, uniform="card_col")
             for i, b in enumerate(books):
                 c = BookCard(self.scroll, b, self.launch_editor, self.show_details, self.delete_book,
                              self.handle_select,
@@ -4573,7 +4885,8 @@ class XalibreApp(ctk.CTk, DnDWrapper):
                 if b[0] in self.selected_ids: c.var.set(True)
                 c.grid(row=i // self.cols, column=i % self.cols, padx=10, pady=10, sticky="nsew")
         else:
-            self.scroll.grid_columnconfigure(0, weight=1)
+            for i in range(50): self.scroll.grid_columnconfigure(i, weight=0, uniform="")
+            self.scroll.grid_columnconfigure(0, weight=1, uniform="")
             for i, b in enumerate(books):
                 c = BookRow(self.scroll, b, self.launch_editor, self.show_details, self.delete_book, self.handle_select,
                             self.delete_single_file, self.update_book_status, self._on_mouse_wheel)
@@ -4616,22 +4929,36 @@ class XalibreApp(ctk.CTk, DnDWrapper):
         self.btn_del.configure(state=st, text=f"🗑 Delete ({c})" if c > 0 else "🗑 Delete")
         self.btn_send.configure(state=st, text=f"📲 Send ({c})" if c > 0 else "📲 Send")
 
-    def delete_single_file(self, bid, ftype):
+    def delete_single_file(self, bid, ftype, specific_path=None):
         b = next((x for x in self.all_books if x[0] == bid), None)
         if not b: return
-        path = b[4] if ftype == "xtc" else b[3]
-        if path and os.path.exists(path):
+        target_path = specific_path
+        if not target_path:
+            target_path = b[4] if ftype in ["xtc", "epub_export"] else b[3]
+
+        if target_path and os.path.exists(target_path):
             try:
-                os.remove(path)
-            except:
-                pass
-        if ftype == "xtc":
-            self.db.update_xtc_path(bid, "")
-        else:
+                os.remove(target_path)
+            except Exception as e:
+                print(f"Error removing {target_path}: {e}")
+
+        # Update DB reference if removing the primary path
+        if b[4] and os.path.normpath(b[4]).lower() == os.path.normpath(target_path).lower():
+            # If there's another exported file in EXPORT_DIR, point DB to it
+            exports = [p for p, _ in get_book_export_files(b) if os.path.normpath(p).lower() != os.path.normpath(target_path).lower()]
+            new_path = exports[0] if exports else ""
+            self.db.update_xtc_path(bid, new_path)
+
+        if ftype == "epub" and b[3] and os.path.normpath(b[3]).lower() == os.path.normpath(target_path).lower():
             self.db.conn.cursor().execute("UPDATE books SET path_epub = ? WHERE id = ?", ("", bid))
             self.db.conn.commit()
-        other = b[3] if ftype == "xtc" else b[4]
-        if not other or not os.path.exists(other): self.db.delete_book(bid)
+
+        # Check if book has any remaining files
+        rem_exports = get_book_export_files(b)
+        rem_source = b[3] if ftype != "epub" else ""
+        if not rem_exports and (not rem_source or not os.path.exists(rem_source)):
+            self.db.delete_book(bid)
+
         self.refresh_library()
 
     def delete_book(self, bid):
