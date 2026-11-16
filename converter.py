@@ -479,7 +479,7 @@ def apply_bubble_masked_eink(canvas, render_mode="Floyd-Steinberg", two_bit=Fals
     return out
 
 
-def extract_comic_tiers(pil_img, min_tier_height_pct=0.18, overlap_pct=0.0, rtl=False, is_landscape=False):
+def extract_comic_tiers(pil_img, min_tier_height_pct=0.18, overlap_pct=0.0, rtl=False, is_landscape=False, screen_aspect=None):
     """
     Extracts horizontal comic tiers at real gutters or panel borders.
     - Pre-normalizes contrast so yellowed/gray scans detect gutters reliably.
@@ -569,6 +569,15 @@ def extract_comic_tiers(pil_img, min_tier_height_pct=0.18, overlap_pct=0.0, rtl=
     )
 
     min_h = int(target_h * min_tier_height_pct)
+    if is_landscape:
+        if screen_aspect is not None and screen_aspect > 0:
+            fit_h_pct = (orig_w / float(orig_h)) * float(screen_aspect)
+            max_h_pct = max(min_tier_height_pct * 2.0, min(0.72, fit_h_pct * 1.12))
+        else:
+            max_h_pct = 0.50
+    else:
+        max_h_pct = 0.72
+    max_splash_h = int(target_h * max_h_pct)
     ov_px = int(orig_h * overlap_pct)
 
     # Map cut_y -> (gutter_start_y, gutter_end_y) in scaled coordinates ONLY if a real blank gutter exists
@@ -606,7 +615,8 @@ def extract_comic_tiers(pil_img, min_tier_height_pct=0.18, overlap_pct=0.0, rtl=
 
         best_rel = int(np.argmax(weighted_scores))
         best_y = s0 + best_rel
-        if real_cut_score[best_y] >= 1.75:
+        cut_thresh = 1.45 if (is_landscape and h > max_splash_h) else 1.75
+        if real_cut_score[best_y] >= cut_thresh:
             span = find_gutter_span(best_y)
             if span is not None:
                 mid_g = (span[0] + span[1]) // 2
@@ -616,7 +626,7 @@ def extract_comic_tiers(pil_img, min_tier_height_pct=0.18, overlap_pct=0.0, rtl=
             return split_region(y0, best_y) + split_region(best_y, y1)
 
         # B. No full panel border found: tall full-page splash split (favors low busyness + any partial border)
-        if h > int(target_h * 0.72):
+        if h > max_splash_h:
             mid0 = y0 + int(h * 0.30)
             mid1 = y0 + int(h * 0.70)
             splash_cost = busyness[mid0:mid1] - (real_cut_score[mid0:mid1] * 0.15)
@@ -2444,28 +2454,72 @@ class EpubProcessor:
         page_footnote_info = []
         more = 1
         pending_fns = []
+        pending_fn_story = None
+        pending_fn_committed_rects = []
 
         while more:
             saved_pending = list(pending_fns)
+            saved_fn_story = pending_fn_story
+            saved_fn_rects = list(pending_fn_committed_rects)
             cap_h = content_height
             tmp_doc = None
             used_rect = None
             active_fns = []
-            total_fn_h = 0
+            actual_fn_h = 0
             more_probe = 0
 
             for attempt in range(2):
                 pending_fns = list(saved_pending)
-                full_rect = fitz.Rect(0, 0, self.screen_width, cap_h)
+                pending_fn_story = saved_fn_story
+                pending_fn_committed_rects = list(saved_fn_rects)
+                if pending_fn_story is not None:
+                    pending_fn_story.reset()
+                    for fr in pending_fn_committed_rects:
+                        pending_fn_story.place(fr)
+                        pending_fn_story.draw(None)
+
+                # When attempt == 1 caps body text above a squeezed image (cap_h < content_height),
+                # the lower portion of the page (content_height - cap_h) is free for footnotes,
+                # and body ceilings must be min(cap_h, content_height - fn_h) rather than
+                # subtracting fn_h from cap_h again.
+                if cap_h < content_height:
+                    local_max_fn = min(content_height - 20, max(max_fn_area, content_height - cap_h - 12))
+                else:
+                    local_max_fn = max_fn_area
+
+                # If a long footnote is continuing from the previous page,
+                # measure how much space its remaining text needs on this page.
+                cont_h = 0
+                cont_more = 0
+                if pending_fn_story is not None:
+                    # If no body text remains at all, let the continuing footnote use the full page.
+                    probe_body_more, _ = story.place(fitz.Rect(0, 0, self.screen_width, cap_h))
+                    if probe_body_more == 0 and not pending_fns:
+                        # Check if the body text is actually empty on this page
+                        body_pos_check = []
+                        story.element_positions(lambda p: body_pos_check.append(p))
+                        if not body_pos_check:
+                            local_max_fn = content_height
+                    cont_more, cont_filled = pending_fn_story.place(
+                        fitz.Rect(0, 0, self.screen_width, max(20, local_max_fn - 8))
+                    )
+                    cont_h = min(local_max_fn, fitz.Rect(cont_filled).height + 14)
+
+                # Probe body text in the space above any continuing footnote
+                body_limit = min(cap_h, max(20, content_height - cont_h))
+                full_rect = fitz.Rect(0, 0, self.screen_width, body_limit)
                 more_probe, _ = story.place(full_rect)
                 used_rect = full_rect
 
                 seen_keys = []
+                seen_y1 = {}
                 def check_seen(pos):
                     if pos.href and pos.href.startswith("xtc-fn://"):
                         k = pos.href[len("xtc-fn://"):]
                         if k in fn_labels and k not in seen_keys:
                             seen_keys.append(k)
+                            if pos.rect:
+                                seen_y1[k] = pos.rect[3]
                 story.element_positions(check_seen)
 
                 # Footnotes eligible for this page: any pending carryovers + newly seen keys
@@ -2475,52 +2529,135 @@ class EpubProcessor:
                         page_candidates.append(k)
 
                 active_fns = []
-                total_fn_h = 0
+                actual_fn_h = cont_h
 
-                if page_candidates:
-                    local_max_fn = min(max_fn_area, cap_h * 0.45)
-                    # 1. Determine how many footnotes can fit within local_max_fn
+                if page_candidates and cont_more == 0:
+                    avail_for_new = max(0, local_max_fn - cont_h)
+                    pad_overhead = 14 if cont_h == 0 else 3
                     fitting_fns = []
                     accum_h = 0
+                    min_fn_start_h = max(44.0, fn_font_size * fn_line_height * 2.2 + 16.0)
                     for k in page_candidates:
                         fn_h = fn_cache[k][0] + 3
-                        if accum_h + fn_h <= local_max_fn or not fitting_fns:
+                        if accum_h + fn_h + pad_overhead <= avail_for_new or (not fitting_fns and avail_for_new >= min_fn_start_h):
                             fitting_fns.append(k)
                             accum_h += fn_h
                         else:
                             break
 
-                    req_h = sum(fn_cache[k][0] for k in fitting_fns) + (len(fitting_fns) - 1) * 3 + 14
-                    req_h = min(req_h, local_max_fn)
-                    shrunk_rect = fitz.Rect(0, 0, self.screen_width, max(20, cap_h - req_h))
-                    more_probe, _ = story.place(shrunk_rect)
-                    used_rect = shrunk_rect
+                    if fitting_fns:
+                        req_new_h = sum(fn_cache[k][0] for k in fitting_fns) + (len(fitting_fns) - 1) * 3 + pad_overhead
+                        req_h = min(cont_h + req_new_h, local_max_fn)
+                        shrunk_limit = min(cap_h, max(20, content_height - req_h))
+                        shrunk_rect = fitz.Rect(0, 0, self.screen_width, shrunk_limit)
+                        more_probe, _ = story.place(shrunk_rect)
+                        used_rect = shrunk_rect
 
-                    # Check which new markers actually landed on this shrunk page
-                    shrunk_seen = []
-                    def check_shrunk(pos):
-                        if pos.href and pos.href.startswith("xtc-fn://"):
-                            k = pos.href[len("xtc-fn://"):]
-                            if k in fn_labels and k not in shrunk_seen:
-                                shrunk_seen.append(k)
-                    story.element_positions(check_shrunk)
+                        shrunk_seen = []
+                        def check_shrunk(pos):
+                            if pos.href and pos.href.startswith("xtc-fn://"):
+                                k = pos.href[len("xtc-fn://"):]
+                                if k in fn_labels and k not in shrunk_seen:
+                                    shrunk_seen.append(k)
+                        story.element_positions(check_shrunk)
 
-                    # Active footnotes: pending carryovers + newly seen markers that fit in fitting_fns
-                    active_fns = []
-                    for k in fitting_fns:
-                        if k in pending_fns or k in shrunk_seen:
-                            active_fns.append(k)
+                        active_fns = [k for k in fitting_fns if k in pending_fns or k in shrunk_seen]
+                        # If the full footnote pushed its own marker off the page, check if the
+                        # marker has room for at least ~2 lines of footnote below it; if so, start
+                        # the footnote on this page and spill the rest onto the next page.
+                        if not active_fns and fitting_fns and cont_h == 0:
+                            k0 = fitting_fns[0]
+                            k0_y1 = seen_y1.get(k0)
+                            line_clear = max(18.0, self.font_size * 0.8)
+                            min_fn_start_h = max(44.0, fn_font_size * fn_line_height * 2.2 + 16.0)
+                            if k0_y1 is not None and (min(cap_h, content_height) - k0_y1 - line_clear) >= min_fn_start_h:
+                                active_fns = [k0]
+                                actual_fn_h = min(local_max_fn, content_height - k0_y1 - line_clear)
+                            else:
+                                actual_fn_h = cont_h
+                        elif active_fns:
+                            actual_new_h = sum(fn_cache[k][0] for k in active_fns) + (len(active_fns) - 1) * 3 + pad_overhead
+                            actual_fn_h = min(cont_h + actual_new_h, local_max_fn)
+                        else:
+                            actual_fn_h = cont_h
 
-                    if active_fns:
-                        total_fn_h = sum(fn_cache[k][0] for k in active_fns) + (len(active_fns) - 1) * 3 + 14
-                        total_fn_h = min(total_fn_h, max_fn_area)
+                        # If markers were pushed off by shrinking, reclaim the unused bottom space
+                        # so the page doesn't end up half-empty.
+                        final_seen = shrunk_seen
+                        if actual_fn_h + 4 < req_h:
+                            reclaimed_limit = min(cap_h, max(20, content_height - actual_fn_h))
+                            reclaimed_rect = fitz.Rect(0, 0, self.screen_width, reclaimed_limit)
+                            more_probe, _ = story.place(reclaimed_rect)
+                            used_rect = reclaimed_rect
+                            reclaimed_seen = []
+                            def check_reclaimed(pos):
+                                if pos.href and pos.href.startswith("xtc-fn://"):
+                                    k = pos.href[len("xtc-fn://"):]
+                                    if k in fn_labels and k not in reclaimed_seen:
+                                        reclaimed_seen.append(k)
+                            story.element_positions(check_reclaimed)
+                            final_seen = reclaimed_seen
+
+                            # Never render a new footnote before its marker appears on the page.
+                            # If the partial-start reservation was just a few pixels too tall for
+                            # the marker's line box (e.g. superscript rect above baseline), step
+                            # actual_fn_h down slightly before giving up and deferring.
+                            verified_fns = [k for k in active_fns if k in pending_fns or k in final_seen]
+                            if not verified_fns and active_fns and cont_h == 0:
+                                k0 = active_fns[0]
+                                step = max(16.0, self.font_size * self.line_height * 0.8)
+                                min_fn_start_h = max(44.0, fn_font_size * fn_line_height * 2.2 + 16.0)
+                                cand_h = actual_fn_h
+                                for _ in range(3):
+                                    cand_h -= step
+                                    if cand_h < min_fn_start_h:
+                                        break
+                                    cand_rect = fitz.Rect(0, 0, self.screen_width, min(cap_h, max(20, content_height - cand_h)))
+                                    more_probe, _ = story.place(cand_rect)
+                                    used_rect = cand_rect
+                                    cand_seen = []
+                                    story.element_positions(lambda pos: cand_seen.append(pos.href[len("xtc-fn://"):])
+                                                            if (pos.href and pos.href.startswith("xtc-fn://")
+                                                                and pos.href[len("xtc-fn://"):] in fn_labels
+                                                                and pos.href[len("xtc-fn://"):] not in cand_seen) else None)
+                                    if k0 in cand_seen:
+                                        verified_fns = [k0]
+                                        actual_fn_h = cand_h
+                                        final_seen = cand_seen
+                                        break
+
+                            if len(verified_fns) != len(active_fns):
+                                active_fns = verified_fns
+                                if active_fns:
+                                    actual_new_h = sum(fn_cache[k][0] for k in active_fns) + (len(active_fns) - 1) * 3 + pad_overhead
+                                    actual_fn_h = min(actual_fn_h, min(cont_h + actual_new_h, local_max_fn))
+                                else:
+                                    actual_fn_h = cont_h
+                                    full_reclaim = fitz.Rect(0, 0, self.screen_width, min(cap_h, max(20, content_height - actual_fn_h)))
+                                    more_probe, _ = story.place(full_reclaim)
+                                    used_rect = full_reclaim
+                                    final_seen = []
+                                    story.element_positions(lambda pos: final_seen.append(pos.href[len("xtc-fn://"):])
+                                                            if (pos.href and pos.href.startswith("xtc-fn://")
+                                                                and pos.href[len("xtc-fn://"):] in fn_labels
+                                                                and pos.href[len("xtc-fn://"):] not in final_seen) else None)
+
+                        new_pending = []
+                        for k in pending_fns + final_seen:
+                            if k not in active_fns and k not in new_pending:
+                                new_pending.append(k)
+                        pending_fns = new_pending
                     else:
-                        total_fn_h = 0
-
-                    # Carry over any footnotes that were seen but couldn't fit on this page
-                    new_pending = []
-                    for k in pending_fns + shrunk_seen:
-                        if k not in active_fns and k not in new_pending:
+                        new_pending = list(pending_fns)
+                        for k in seen_keys:
+                            if k not in new_pending:
+                                new_pending.append(k)
+                        pending_fns = new_pending
+                elif page_candidates and cont_more != 0:
+                    # Continuing footnote already fills the footnote area; defer all others.
+                    new_pending = list(pending_fns)
+                    for k in seen_keys:
+                        if k not in new_pending:
                             new_pending.append(k)
                     pending_fns = new_pending
 
@@ -2529,14 +2666,29 @@ class EpubProcessor:
                 dev = tmp_writer.begin_page(fitz.Rect(0, 0, self.screen_width, content_height))
                 story.draw(dev)
 
-                if active_fns:
-                    fn_box_top = content_height - total_fn_h
-                    combined_items = "".join(fn_cache[k][1] for k in active_fns)
-                    fn_page_html = f"<html><head>{fn_css}</head><body>{combined_items}</body></html>"
-                    fn_story = fitz.Story(html=fn_page_html)
-                    fn_rect = fitz.Rect(0, fn_box_top + 8, self.screen_width, content_height)
-                    fn_story.place(fn_rect)
-                    fn_story.draw(dev)
+                if actual_fn_h > 0 and (pending_fn_story is not None or active_fns):
+                    fn_box_top = content_height - actual_fn_h
+                    if pending_fn_story is not None:
+                        cont_bottom = (fn_box_top + cont_h) if active_fns else content_height
+                        cont_rect = fitz.Rect(0, fn_box_top + 8, self.screen_width, cont_bottom)
+                        cont_more_after, _ = pending_fn_story.place(cont_rect)
+                        pending_fn_story.draw(dev)
+                        pending_fn_committed_rects.append(cont_rect)
+                        if cont_more_after == 0:
+                            pending_fn_story = None
+                            pending_fn_committed_rects = []
+
+                    if active_fns:
+                        new_top = (fn_box_top + cont_h) if cont_h > 0 else (fn_box_top + 8)
+                        combined_items = "".join(fn_cache[k][1] for k in active_fns)
+                        fn_page_html = f"<html><head>{fn_css}</head><body>{combined_items}</body></html>"
+                        new_fn_story = fitz.Story(html=fn_page_html)
+                        new_fn_rect = fitz.Rect(0, new_top, self.screen_width, content_height)
+                        new_fn_more, _ = new_fn_story.place(new_fn_rect)
+                        new_fn_story.draw(dev)
+                        if new_fn_more != 0:
+                            pending_fn_story = new_fn_story
+                            pending_fn_committed_rects = [new_fn_rect]
 
                 tmp_writer.end_page()
                 tmp_writer.close()
@@ -2552,15 +2704,17 @@ class EpubProcessor:
                             story.draw(None)
                         cap_h = max(20, shrunk_y - 2)
                         continue
-                    elif shrunk_y is not None and shrunk_y <= 20 and active_fns:
+                    elif shrunk_y is not None and shrunk_y <= 20 and (active_fns or cont_h > 0):
                         # Top-of-page image was squeezed by footnotes on this page; defer footnotes
                         story.reset()
                         for r in committed_rects:
                             story.place(r)
                             story.draw(None)
                         pending_fns = list(saved_pending)
+                        pending_fn_story = saved_fn_story
+                        pending_fn_committed_rects = list(saved_fn_rects)
                         active_fns = []
-                        total_fn_h = 0
+                        actual_fn_h = 0
                         used_rect = fitz.Rect(0, 0, self.screen_width, content_height)
                         more_probe, _ = story.place(used_rect)
                         tmp_stream = io.BytesIO()
@@ -2574,11 +2728,12 @@ class EpubProcessor:
 
             doc.insert_pdf(tmp_doc)
             committed_rects.append(used_rect)
-            page_footnote_info.append((active_fns, total_fn_h if active_fns else 0))
-            more = more_probe or bool(pending_fns)
+            has_fn = bool(active_fns) or cont_h > 0
+            page_footnote_info.append((has_fn, actual_fn_h if has_fn else 0))
+            more = more_probe or bool(pending_fns) or (pending_fn_story is not None)
 
-        for page_i, (f_keys, fn_h) in enumerate(page_footnote_info):
-            if f_keys and fn_h > 0:
+        for page_i, (has_fn, fn_h) in enumerate(page_footnote_info):
+            if has_fn and fn_h > 0:
                 p = doc[page_i]
                 rule_y = content_height - fn_h + 4
                 rule_width = min(80, (self.screen_width - 2 * self.margin) * 0.35)
@@ -2586,7 +2741,7 @@ class EpubProcessor:
                     fitz.Point(self.margin, rule_y),
                     fitz.Point(self.margin + rule_width, rule_y),
                     color=(0, 0, 0),
-                    width=0.6
+                    width=1.0
                 )
 
         return doc
@@ -4558,8 +4713,11 @@ class EpubProcessor:
 
         margin_top_classes = {}
         margin_bottom_classes = {}
-
+        margin_left_classes = {}
         margin_right_classes = {}
+        padding_left_classes = {}
+        padding_right_classes = {}
+        spacer_height_classes = {}
         font_style_classes = {}
 
         # 1. HARD KILL PATTERN (Layout locks)
@@ -4610,7 +4768,7 @@ class EpubProcessor:
                 # that's the whole point, "no indent" is a real, common,
                 # deliberate choice and needs to be distinguishable from
                 # "book didn't say anything, use the default").
-                text_indent_match = re.search(r'text-indent\s*:\s*([\d\.]+(?:em|px|%|pt)|0)', style, re.I)
+                text_indent_match = re.search(r'text-indent\s*:\s*(-?[\d\.]+(?:em|px|%|pt)|0)', style, re.I)
 
                 active_nuclear = nuclear_pattern_no_dims if is_table_tag else nuclear_pattern
                 clean_style = active_nuclear.sub("", style)
@@ -4719,47 +4877,93 @@ class EpubProcessor:
                 # Promoting "left" here was silently overriding the user's
                 # global justify setting on ordinary body text anywhere the
                 # book's default text class happened to say "left".
-                align_prop_match = re.search(r'text-align\s*:\s*(center|right|justify)', prop_str)
+                # Include "left" here so minority classes (poems, subheadings,
+                # callout boxes, bibliographies) keep left-alignment when body
+                # text is justified; generic body classes (>50% of prose) are
+                # still filtered out in PHASE 2a below.
+                align_prop_match = re.search(r'text-align\s*:\s*(left|center|right|justify)', prop_str)
                 if align_prop_match:
                     found_classes = _simple_classes(selector_str)
                     for cls in found_classes:
                         alignment_classes[cls] = align_prop_match.group(1)
 
                 # Same lightweight scan, but for an explicit class-based
-                # text-indent (e.g. ".chapter-open { text-indent: 0 }").
-                indent_prop_match = re.search(r'text-indent\s*:\s*([\d.]+(?:em|px|%)|0)', prop_str)
+                # text-indent (including negative hanging indents).
+                indent_prop_match = re.search(r'text-indent\s*:\s*(-?[\d.]+(?:em|px|%|pt)|0)', prop_str)
                 if indent_prop_match:
                     found_classes = _simple_classes(selector_str)
                     for cls in found_classes:
                         indent_classes[cls] = indent_prop_match.group(1)
 
-                # Look for explicit margin-top classes
-                m_top_match = re.search(r'margin-top\s*:\s*([\d.]+(?:em|px|%|pt)|0)', prop_str)
-                if m_top_match:
-                    for cls in _simple_classes(selector_str):
-                        margin_top_classes[cls] = m_top_match.group(1)
+                target_classes = _simple_classes(selector_str)
+                if target_classes:
+                    # Parse margin shorthand (1-4 values) then let longhand override
+                    m_vals = {}
+                    m_short = re.search(r'(?:^|;)\s*margin\s*:\s*([^;]+)', prop_str)
+                    if m_short:
+                        toks = [t for t in m_short.group(1).strip().split()
+                                if re.fullmatch(r'-?[\d.]+(?:em|px|%|pt)|0', t)]
+                        if len(toks) == 1:
+                            m_vals = {'top': toks[0], 'right': toks[0], 'bottom': toks[0], 'left': toks[0]}
+                        elif len(toks) == 2:
+                            m_vals = {'top': toks[0], 'right': toks[1], 'bottom': toks[0], 'left': toks[1]}
+                        elif len(toks) == 3:
+                            m_vals = {'top': toks[0], 'right': toks[1], 'bottom': toks[2], 'left': toks[1]}
+                        elif len(toks) >= 4:
+                            m_vals = {'top': toks[0], 'right': toks[1], 'bottom': toks[2], 'left': toks[3]}
 
-                # Look for explicit margin-bottom classes
-                m_bot_match = re.search(r'margin-bottom\s*:\s*([\d.]+(?:em|px|%|pt)|0)', prop_str)
-                if m_bot_match:
-                    for cls in _simple_classes(selector_str):
-                        margin_bottom_classes[cls] = m_bot_match.group(1)
+                    for side, cmap in (('top', margin_top_classes), ('bottom', margin_bottom_classes),
+                                       ('left', margin_left_classes), ('right', margin_right_classes)):
+                        long_m = re.search(rf'(?:^|;)\s*margin-{side}\s*:\s*([\d.]+(?:em|px|%|pt)|0)', prop_str)
+                        val = long_m.group(1) if long_m else m_vals.get(side)
+                        if val is not None:
+                            for cls in target_classes:
+                                cmap[cls] = val
 
-                # Look for explicit margin-right classes
-                m_right_match = re.search(r'margin-right\s*:\s*([\d.]+(?:em|px|%|pt)|0)', prop_str)
-                if m_right_match:
-                    for cls in _simple_classes(selector_str):
-                        margin_right_classes[cls] = m_right_match.group(1)
+                    # Parse padding shorthand / left & right so callout boxes
+                    # aren't crushed by custom_css's padding-left/right: 0 !important
+                    p_vals = {}
+                    p_short = re.search(r'(?:^|;)\s*padding\s*:\s*([^;]+)', prop_str)
+                    if p_short:
+                        toks = [t for t in p_short.group(1).strip().split()
+                                if re.fullmatch(r'[\d.]+(?:em|px|%|pt)|0', t)]
+                        if len(toks) == 1:
+                            p_vals = {'right': toks[0], 'left': toks[0]}
+                        elif len(toks) in (2, 3):
+                            p_vals = {'right': toks[1], 'left': toks[1]}
+                        elif len(toks) >= 4:
+                            p_vals = {'right': toks[1], 'left': toks[3]}
 
-                # Look for explicit font styles/weights
-                if re.search(r'font-style\s*:\s*italic', prop_str, re.I):
-                    for cls in _simple_classes(selector_str):
-                        font_style_classes[cls] = "font-style: italic"
+                    for side, pmap in (('left', padding_left_classes), ('right', padding_right_classes)):
+                        long_p = re.search(rf'(?:^|;)\s*padding-{side}\s*:\s*([\d.]+(?:em|px|%|pt)|0)', prop_str)
+                        val = long_p.group(1) if long_p else p_vals.get(side)
+                        if val is not None:
+                            for cls in target_classes:
+                                pmap[cls] = val
 
-                if re.search(r'font-weight\s*:\s*(bold|bolder|[789]00)', prop_str, re.I):
-                    for cls in _simple_classes(selector_str):
-                        # Merge into the same dictionary to keep the loop simple
-                        font_style_classes[cls] = "font-weight: bold"
+                    # Spacer height (applied only to empty spacer elements in Phase 2e)
+                    h_match = re.search(r'(?:^|;)\s*height\s*:\s*([\d.]+(?:em|px|pt))', prop_str)
+                    if h_match:
+                        for cls in target_classes:
+                            spacer_height_classes[cls] = h_match.group(1)
+
+                    # Font styles/weights/variants (merge instead of overwriting)
+                    f_rules = []
+                    if re.search(r'font-style\s*:\s*italic', prop_str, re.I):
+                        f_rules.append("font-style: italic")
+                    if re.search(r'font-weight\s*:\s*(bold|bolder|[789]00)', prop_str, re.I):
+                        f_rules.append("font-weight: bold")
+                    if re.search(r'font-variant\s*:\s*small-caps', prop_str, re.I):
+                        f_rules.append("font-variant: small-caps")
+                    tt_match = re.search(r'text-transform\s*:\s*(uppercase|lowercase|capitalize)', prop_str, re.I)
+                    if tt_match:
+                        f_rules.append(f"text-transform: {tt_match.group(1)}")
+                    if f_rules:
+                        for cls in target_classes:
+                            existing_rules = font_style_classes.setdefault(cls, [])
+                            for r in f_rules:
+                                if r not in existing_rules:
+                                    existing_rules.append(r)
 
         # --- PHASE 2a: SAFETY NET AGAINST GENERIC/STRUCTURAL CLASSES ---
         # Even a "simple" .foo selector can be a generic class that a
@@ -4770,7 +4974,9 @@ class EpubProcessor:
         # genuinely deliberate alignment/indent (poems, dedications,
         # pull-quotes) is applied to a minority of elements. Drop anything
         # that fails that sniff test before it gets promoted in 2b/2c.
-        if alignment_classes or indent_classes or margin_top_classes or margin_bottom_classes or margin_right_classes:
+        if (alignment_classes or indent_classes or margin_top_classes or margin_bottom_classes
+                or margin_left_classes or margin_right_classes or padding_left_classes
+                or padding_right_classes or spacer_height_classes):
             prose_tags = soup.find_all(['p', 'div', 'li', 'dd', 'dt', 'blockquote'])
             total_prose = len(prose_tags) or 1
             class_counts = {}
@@ -4785,7 +4991,11 @@ class EpubProcessor:
                     indent_classes.pop(cls, None)
                     margin_top_classes.pop(cls, None)
                     margin_bottom_classes.pop(cls, None)
+                    margin_left_classes.pop(cls, None)
                     margin_right_classes.pop(cls, None)
+                    padding_left_classes.pop(cls, None)
+                    padding_right_classes.pop(cls, None)
+                    spacer_height_classes.pop(cls, None)
                     # Note: We deliberately do NOT pop font_style_classes here.
                     # If an author italicizes 60% of a book, it's an artistic choice, not a structural reset.
 
@@ -4869,8 +5079,16 @@ class EpubProcessor:
             if _follows_heading(p_tag):
                 p_tag['style'] = self._append_style(existing_style, "text-indent: 0 !important")
 
-        # --- PHASE 2e: PROMOTE CLASS-BASED MARGINS AND FONTS TO INLINE ---
-        if margin_top_classes or margin_bottom_classes or margin_right_classes or font_style_classes:
+        # --- PHASE 2e: PROMOTE CLASS-BASED MARGINS, PADDING, SPACERS, AND FONTS TO INLINE ---
+        spacing_prop_maps = (
+            ('margin-top', margin_top_classes),
+            ('margin-bottom', margin_bottom_classes),
+            ('margin-left', margin_left_classes),
+            ('margin-right', margin_right_classes),
+            ('padding-left', padding_left_classes),
+            ('padding-right', padding_right_classes),
+        )
+        if any(cmap for _, cmap in spacing_prop_maps) or spacer_height_classes or font_style_classes:
             for tag in soup.find_all(True):
                 classes = tag.get('class', [])
                 if isinstance(classes, str):
@@ -4880,28 +5098,28 @@ class EpubProcessor:
 
                 existing_style = tag.get('style', '')
                 injections = []
+                lower_classes = [c.lower() for c in classes]
 
-                if 'margin-top' not in existing_style:
-                    for cls in classes:
-                        if cls.lower() in margin_top_classes:
-                            injections.append(f"margin-top: {margin_top_classes[cls.lower()]} !important")
+                for prop_name, cmap in spacing_prop_maps:
+                    if not cmap or prop_name in existing_style:
+                        continue
+                    chosen = None
+                    for cls_l in lower_classes:
+                        if cls_l in cmap:
+                            chosen = cmap[cls_l]
+                    if chosen is not None:
+                        injections.append(f"{prop_name}: {chosen} !important")
+
+                if spacer_height_classes and not tag.get_text(strip=True) and not tag.find(['img', 'svg']):
+                    for cls_l in lower_classes:
+                        if cls_l in spacer_height_classes:
+                            injections.append(f"min-height: {spacer_height_classes[cls_l]} !important")
                             break
 
-                if 'margin-bottom' not in existing_style:
-                    for cls in classes:
-                        if cls.lower() in margin_bottom_classes:
-                            injections.append(f"margin-bottom: {margin_bottom_classes[cls.lower()]} !important")
-                            break
-
-                if 'margin-right' not in existing_style:
-                    for cls in classes:
-                        if cls.lower() in margin_right_classes:
-                            injections.append(f"margin-right: {margin_right_classes[cls.lower()]} !important")
-                            break
-
-                for cls in classes:
-                    if cls.lower() in font_style_classes:
-                        injections.append(f"{font_style_classes[cls.lower()]} !important")
+                for cls_l in lower_classes:
+                    if cls_l in font_style_classes:
+                        for rule in font_style_classes[cls_l]:
+                            injections.append(f"{rule} !important")
 
                 if injections:
                     tag['style'] = self._append_style(existing_style, "; ".join(injections))
@@ -5321,7 +5539,10 @@ class EpubProcessor:
                 for half in halves:
                     if zoom_mode == "Tiers (Smart)":
                         ov_pct = float(ls.get("comic_overlap", 6)) / 100.0
-                        is_land = getattr(self, "screen_width", 0) > getattr(self, "screen_height", 1)
+                        sw = getattr(self, "screen_width", 0)
+                        sh = getattr(self, "screen_height", 1)
+                        is_land = sw > sh
+                        scr_aspect = (sh / float(sw)) if sw > 0 else None
                         tcache = self.__dict__.setdefault("_tier_cache", {})
                         tkey = (
                             pi,
@@ -5331,6 +5552,7 @@ class EpubProcessor:
                             round(float(ls.get("comic_crop_pad", 1.5)), 2),
                             round(ov_pct, 4),
                             is_land,
+                            round(scr_aspect, 4) if scr_aspect is not None else None,
                             rtl
                         )
                         tiers = tcache.get(tkey)
@@ -5346,7 +5568,7 @@ class EpubProcessor:
                             if rot:
                                 base_crop = base_crop.transpose(Image.ROTATE_270)
 
-                            tiers = extract_comic_tiers(base_crop, overlap_pct=ov_pct, rtl=rtl, is_landscape=is_land)
+                            tiers = extract_comic_tiers(base_crop, overlap_pct=ov_pct, rtl=rtl, is_landscape=is_land, screen_aspect=scr_aspect)
                             tcache[tkey] = tiers
                         for t_idx, tier_bbox in enumerate(tiers):
                             self.comic_units.append({
@@ -5652,9 +5874,9 @@ class EpubProcessor:
                     if y1 > pad_max_y:
                         y0 -= (y1 - pad_max_y)
                         y1 = pad_max_y
-                    y0 = max(pad_min_y, int(round(y0)))
-                    y1 = min(pad_max_y, int(round(y1)))
-                    tb = (0, y0, pw, y1)
+                    y0 = int(round(max(pad_min_y, y0)))
+                    y1 = int(round(min(pad_max_y, y1)))
+                    tb = (int(tb[0]), y0, int(tb[2]), y1)
 
                     if peek_mode == "Dimmed" and np is not None:
                         # Dim strictly from the true panel gutters outward into the adjacent tier.
